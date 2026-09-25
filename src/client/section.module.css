@@ -1,0 +1,29 @@
+/**
+ * Chrome for the http-proxy settings page.
+ *
+ * A settings section owns its own column contents — the shell contributes the
+ * navigation row only — so this mirrors the wrapper the bundled settings pages
+ * use (same max width, same heading scale, same tertiary intro), which is what
+ * keeps a plugin-authored page looking like it shipped with DSH. Colors come
+ * from the host's `--dsw-*` tokens, never from literals.
+ */
+
+.section {
+  max-width: 720px;
+  color: var(--dsw-alias-label-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.heading {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.intro {
+  color: var(--dsw-alias-label-tertiary);
+  margin: 0;
+  font-size: 13px;
+}

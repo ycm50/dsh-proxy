@@ -1,5 +1,5 @@
 /**
- * The http-proxy settings page's staged form over the `http-proxy` settings
+ * The dsh-proxy settings page's staged form over the `dsh-proxy` settings
  * namespace, plus the read-only `llm-pi-ai` view that supplies the known-host
  * pick list for the two host fields.
  *
@@ -9,13 +9,13 @@
  * every edit in one revision-fenced `mutate` on save. This module only says how
  * this plugin's three fields convert between stored values and draft text, and
  * where the pick list comes from.
- * @module dsh-http-proxy/client/form-controller
+ * @module dsh-proxy/client/form-controller
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis';
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store';
 import type { SettingsFieldState, SettingsFormActions, SettingsFormShell } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client';
-/** The `http-proxy` section fields this page edits (the wire shape). */
+/** The `dsh-proxy` section fields this page edits (the wire shape). */
 export interface HttpProxySettings {
     /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
     proxy?: string;
@@ -34,7 +34,7 @@ export interface PiAiSettings {
 export type HostFieldName = 'proxyHosts' | 'excludeHosts';
 /** One editable field of the page. */
 export type FieldName = 'proxy' | HostFieldName;
-/** What the http-proxy settings page renders. */
+/** What the dsh-proxy settings page renders. */
 export interface HttpProxyFormState extends SettingsFormShell {
     /** Staged proxy URL. */
     proxy: SettingsFieldState;
@@ -52,7 +52,7 @@ export interface HttpProxyFormFace extends SettingsFormActions {
         httpProxyForm: SnapshotStore<HttpProxyFormState>;
     };
 }
-/** Bridges the `http-proxy` config form onto the settings page. */
+/** Bridges the `dsh-proxy` config form onto the settings page. */
 export declare class HttpProxyFormController {
     private readonly scope;
     private readonly knownNs;
@@ -62,7 +62,7 @@ export declare class HttpProxyFormController {
     private readonly disposers;
     /**
      * @param ctx - the browser plugin context, for the shared settings mirror.
-     * @param scope - the shared config form of the `http-proxy` Host entry.
+     * @param scope - the shared config form of the `dsh-proxy` Host entry.
      * @param knownNs - namespace whose configured gateways feed the pick list.
      */
     constructor(ctx: ClientContext, scope: ConfigForm<HttpProxySettings>, knownNs: string);

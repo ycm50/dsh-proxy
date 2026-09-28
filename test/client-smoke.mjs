@@ -68,7 +68,7 @@ globalThis.cancelAnimationFrame = noop
 let registration
 windowStub.__ModuleLoader__ = { load(reg) { registration = reg } }
 await import('../lib/client.js')
-check('bundle registers itself under its package id', registration?.id === 'dsh-http-proxy', String(registration?.id))
+check('bundle registers itself under its package id', registration?.id === 'dsh-proxy', String(registration?.id))
 check('bundle exposes a factory', typeof registration?.factory === 'function')
 
 // The seed module table the shell installs before any bundle runs.
@@ -86,7 +86,7 @@ check('materializing the bundle only asks for seed words', required.every(s => s
 check('bundle exports apply()', typeof exports_.apply === 'function')
 check('bundle injects the 0.1.7 services', JSON.stringify(exports_.inject) === JSON.stringify(['slots', 'locale', 'configForms']), JSON.stringify(exports_.inject))
 check('bundle ships its own stylesheet', styleTags.length > 0, String(styleTags.length))
-check('the stylesheet is plugin-owned', styleTags.every(tag => tag.dataset.plugin === 'dsh-http-proxy'))
+check('the stylesheet is plugin-owned', styleTags.every(tag => tag.dataset.plugin === 'dsh-proxy'))
 
 // --- 2. Run apply() against a stubbed browser context -----------------------
 const registrations = []
@@ -137,14 +137,14 @@ exports_.apply(ctx)
 check('binds the dictionary namespace', boundNamespace === 'settings.httpProxy', String(boundNamespace))
 check('registers both dictionaries', registeredDictionaries?.ns === 'settings.httpProxy'
   && typeof registeredDictionaries.dicts.zh === 'object' && typeof registeredDictionaries.dicts.en === 'object')
-check('opens the config form on the Host entry id', scope.entryId === 'http-proxy', String(scope.entryId))
-check('watches the served namespace', JSON.stringify(servedNamespaces) === JSON.stringify(['http-proxy']), JSON.stringify(servedNamespaces))
+check('opens the config form on the Host entry id', scope.entryId === 'dsh-proxy', String(scope.entryId))
+check('watches the served namespace', JSON.stringify(servedNamespaces) === JSON.stringify(['dsh-proxy']), JSON.stringify(servedNamespaces))
 check('waits on the settings.section slot', JSON.stringify(injectedSlots) === JSON.stringify(['settings.section']), JSON.stringify(injectedSlots))
 
 const entry = registrations[0]
 check('registers exactly one navigation row', registrations.length === 1, String(registrations.length))
 check('registration targets settings.section', entry?.options.name === 'settings.section')
-check('section key matches the Host entry id', entry?.options.id === 'http-proxy')
+check('section key matches the Host entry id', entry?.options.id === 'dsh-proxy')
 check('section carries a nav position after the built-ins', typeof entry?.options.order === 'number' && entry.options.order > 15, String(entry?.options.order))
 check('section carries a label thunk', typeof entry?.options.label === 'function' && entry.options.label() === '«title»')
 check('section declares its locale namespace', entry?.options.locale === 'settings.httpProxy')
@@ -172,12 +172,12 @@ const page = renderToStaticMarkup(createElement(entry.component, {
   t: (key) => `«${key}»`,
 }))
 
-check('page renders its own heading', page.includes('http-proxy-heading') && page.includes('«title»'), page.slice(0, 160))
+check('page renders its own heading', page.includes('dsh-proxy-heading') && page.includes('«title»'), page.slice(0, 160))
 check('page renders the one-line intro', page.includes('«description»'))
 check('page renders the form frame', page.includes('«save»'))
 check('page renders the proxy control with its stored value', page.includes('socks5://127.0.0.1:7890'))
 check('page renders the proxy label', page.includes('«proxy»'))
-check('page renders both host fields', page.includes('http-proxy-hosts') && page.includes('http-proxy-exclude'))
+check('page renders both host fields', page.includes('dsh-proxy-hosts') && page.includes('dsh-proxy-exclude'))
 check('page renders the stored host list as text', page.includes('gateway.acme.example'))
 check('page offers the known-host pick list', page.includes('«suggestions»'))
 check('page marks the saved proxy overridden', page.includes('«overridden»'))

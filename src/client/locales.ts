@@ -1,11 +1,11 @@
 /**
- * Locale bundles for the http-proxy settings card.
+ * Locale bundles for the dsh-proxy settings card.
  *
  * Both shipped languages are required together by `ctx.locale.register`, and
  * the key sets are checked against the namespace declaration in
  * `contract.ts` — so a key added to one dictionary and forgotten in the other
  * is a compile error rather than a raw key on screen.
- * @module dsh-http-proxy/client/locales
+ * @module dsh-proxy/client/locales
  */
 
 /** English copy. */

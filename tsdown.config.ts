@@ -1,5 +1,5 @@
 /**
- * tsdown build for dsh-http-proxy: the host-half lib (lib/index.js, ESM node)
+ * tsdown build for dsh-proxy: the host-half lib (lib/index.js, ESM node)
  * plus the browser client bundle (lib/client.js, CJS closure factory).
  *
  * The client bundle replicates the official DSH client-bundle preset
@@ -91,10 +91,10 @@ function cssModulesInline(): NonNullable<UserConfig['plugins']> {
       for (const [local, exp] of exportEntries) classMap[local] = exp.name
       return [
         `const css = ${JSON.stringify(code.toString())};`,
-        `const tagId = ${JSON.stringify(`dsh-http-proxy/${basename(fileId)}`)};`,
+        `const tagId = ${JSON.stringify(`dsh-proxy/${basename(fileId)}`)};`,
         'if (typeof document !== \'undefined\' && document.querySelector(\'style[data-plugin-css=\' + JSON.stringify(tagId) + \']\') === null) {',
         '  const tag = document.createElement(\'style\');',
-        '  tag.dataset.plugin = \'dsh-http-proxy\';',
+        '  tag.dataset.plugin = \'dsh-proxy\';',
         '  tag.dataset.pluginCss = tagId;',
         '  tag.textContent = css;',
         '  document.head.appendChild(tag);',
@@ -108,7 +108,11 @@ function cssModulesInline(): NonNullable<UserConfig['plugins']> {
 export default [
   // Host half: node ESM bundle. Production deps stay external; local files inline.
   {
-    entry: { index: 'src/index.ts' },
+    // `profile-patch` is an entry of its own so it also lands as
+    // `lib/profile-patch.js`: `lib/index.js` imports it over a relative
+    // specifier, which keeps the self-cleanup helper importable — and
+    // testable — without pulling in undici and schemastery.
+    entry: { index: 'src/index.ts', 'profile-patch': 'src/profile-patch.ts' },
     outDir: 'lib',
     format: ['esm'],
     platform: 'node',
@@ -139,7 +143,7 @@ export default [
     plugins: [...purityGate(), ...cssModulesInline()],
     outputOptions: {
       entryFileNames: 'client.js',
-      banner: `window.__ModuleLoader__.load({ id: "dsh-http-proxy", factory: (require) => {`,
+      banner: `window.__ModuleLoader__.load({ id: "dsh-proxy", factory: (require) => {`,
       footer: 'return module.exports; } });',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
       codeSplitting: false,

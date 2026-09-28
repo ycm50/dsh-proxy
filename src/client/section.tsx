@@ -1,5 +1,5 @@
 /**
- * The http-proxy settings page: the page the Settings panel's own left-hand
+ * The dsh-proxy settings page: the page the Settings panel's own left-hand
  * navigation opens, rendered in the content column beside the bundled ones.
  *
  * A plugin that owns a settings page draws the column contents — the shell
@@ -8,7 +8,7 @@
  * `SettingsValueField`, which is what gives the page the overridden badge, the
  * reset-to-default control, the staged-draft save, and the read-only and
  * unavailable notices without this plugin restating any of them.
- * @module dsh-http-proxy/client/section
+ * @module dsh-proxy/client/section
  */
 
 import type { ReactElement, ReactNode } from 'react'
@@ -129,7 +129,7 @@ function HostField(props: {
 }
 
 /**
- * Render the http-proxy settings page.
+ * Render the dsh-proxy settings page.
  * @param props - locale copy, the page snapshot, and its form actions.
  * @returns the page column.
  */
@@ -152,8 +152,8 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
     />
   )
   return (
-    <section className={css.section} aria-labelledby="http-proxy-heading">
-      <h2 className={css.heading} id="http-proxy-heading">{t('title')}</h2>
+    <section className={css.section} aria-labelledby="dsh-proxy-heading">
+      <h2 className={css.heading} id="dsh-proxy-heading">{t('title')}</h2>
       <p className={css.intro}>{t('description')}</p>
       <SettingsForm
         labels={formLabels(t)}
@@ -162,7 +162,7 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
         onDiscard={props.discard}
       >
         <SettingsValueField
-          id="http-proxy-url"
+          id="dsh-proxy-url"
           label={t('proxy')}
           hint={t('proxyHint')}
           placeholder="socks5://127.0.0.1:7890"
@@ -174,8 +174,8 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
           onEdit={text => { props.edit('proxy', text) }}
           onReset={() => { props.resetField('proxy') }}
         />
-        {hostField('proxyHosts', 'http-proxy-hosts', t('hosts'), t('hostsHint'))}
-        {hostField('excludeHosts', 'http-proxy-exclude', t('exclude'), t('excludeHint'))}
+        {hostField('proxyHosts', 'dsh-proxy-hosts', t('hosts'), t('hostsHint'))}
+        {hostField('excludeHosts', 'dsh-proxy-exclude', t('exclude'), t('excludeHint'))}
       </SettingsForm>
     </section>
   )

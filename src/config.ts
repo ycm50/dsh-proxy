@@ -1,5 +1,5 @@
 /**
- * Configuration schema and validation for `dsh-http-proxy`.
+ * Configuration schema and validation for `dsh-proxy`.
  *
  * DSH 0.1.7 derives the settings page straight from this schema: the Loader
  * reads `entry.fiber.runtime.Config` for the profile entry that mounts the
@@ -8,7 +8,7 @@
  * through `loader/volatile-update`, instead of remounting the plugin — which
  * is what replaced the `settings.installSection` seam the 0.1.2-era API used.
  * A field that is not volatile is not offered by the settings page at all.
- * @module dsh-http-proxy/config
+ * @module dsh-proxy/config
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -96,12 +96,12 @@ export function assertValid(config: Pick<HttpProxyConfig, 'proxy'>): void {
   try {
     parsed = new URL(config.proxy)
   } catch {
-    throw new Error(`http-proxy: invalid proxy URL "${config.proxy}"`)
+    throw new Error(`dsh-proxy: invalid proxy URL "${config.proxy}"`)
   }
   const scheme = parsed.protocol.replace(/:$/, '')
   if (!SUPPORTED_PROXY_SCHEMES.includes(scheme)) {
     throw new Error(
-      `http-proxy: proxy URL "${config.proxy}" uses unsupported scheme "${parsed.protocol}";`
+      `dsh-proxy: proxy URL "${config.proxy}" uses unsupported scheme "${parsed.protocol}";`
       + ` supported schemes: ${SUPPORTED_PROXY_SCHEMES.join(', ')}`,
     )
   }

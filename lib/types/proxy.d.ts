@@ -1,12 +1,12 @@
 /**
- * Proxy transport and host-routing helpers for `dsh-http-proxy`.
+ * Proxy transport and host-routing helpers for `dsh-proxy`.
  *
  * The plugin does not touch DeepSeek Harness source. It installs a wrapper
  * around `globalThis.fetch` — which both the DeepSeek adapter's raw `fetch` and
  * the pi-ai SDK clients call — and routes only model-API hosts through a
  * proxy dispatcher, leaving every other host (web search, web fetch, MCP, …)
  * on the direct path.
- * @module dsh-http-proxy/proxy
+ * @module dsh-proxy/proxy
  */
 export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, hostnameOf, matchesHostEntry, normalizeHostEntry, } from './hosts.js';
 /** Extract the absolute URL string from a `fetch` input. */

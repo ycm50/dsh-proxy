@@ -2,15 +2,21 @@
 node_modules/
 .pnp
 .pnp.js
+.pnpm-store/
 
-# Build output — lib/ is committed ON PURPOSE, so a GitHub install needs no build step
+# Build output — lib/ (including lib/profile-patch.js and lib/types) is committed
+# ON PURPOSE, so a GitHub or tarball install needs no build step
 dist/
 build/
 out/
+coverage/
 *.tsbuildinfo
 
 # Packed artifacts
 *.tgz
+
+# Self-cleanup staging (profile-patch writes beside the patch, then renames)
+*.prune.tmp
 
 # Logs and diagnostics
 *.log

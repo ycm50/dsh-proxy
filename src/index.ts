@@ -1,5 +1,5 @@
 /**
- * `dsh-http-proxy`: route model-API requests through an HTTP/SOCKS proxy
+ * `dsh-proxy`: route model-API requests through an HTTP/SOCKS proxy
  * without modifying DeepSeek Harness source. It wraps `globalThis.fetch` —
  * the transport both the DeepSeek adapter and the pi-ai SDK clients use — and
  * sends only model-API hosts through a proxy dispatcher. Web search, web
@@ -9,7 +9,7 @@
  * place by the settings document, so the running instance re-reads the value
  * on `loader/volatile-update` rather than being remounted. `apply` is
  * therefore installed once and {@link readConfig} is consulted per refresh.
- * @module dsh-http-proxy
+ * @module dsh-proxy
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -30,6 +30,7 @@ import {
   normalizeHostEntry,
 } from './proxy.js'
 import type { ProxyFetch } from './proxy.js'
+import { pruneProxyEntryFromProfile } from './profile-patch.js'
 
 export { Config, assertValid, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js'
 export type { HttpProxyConfig, PluginConfig } from './config.js'
@@ -46,9 +47,19 @@ export {
   urlOf,
 } from './proxy.js'
 export type { ProxyFetch } from './proxy.js'
+export {
+  PROFILE_PATCH_FILE,
+  PROXY_ENTRY_ID,
+  PROXY_IDENTITIES,
+  PROXY_PACKAGE_NAME,
+  profilePatchPath,
+  pruneProxyEntry,
+  pruneProxyEntryFromProfile,
+} from './profile-patch.js'
+export type { PatchPruneResult, ProxyIdentity, ProxyRowCleanup } from './profile-patch.js'
 
 /** Plugin short name (also the profile entry id that carries its settings). */
-export const name = 'http-proxy'
+export const name = 'dsh-proxy'
 
 /** The `llm-pi-ai` namespace, read here for its configured gateway hostnames. */
 const PI_AI_NS = 'llm-pi-ai'
@@ -79,7 +90,7 @@ function piAiGateways(ctx: Context): string[] {
     // Reading another plugin's section must never cost this plugin its
     // routing: an unsettled settings document simply contributes no gateways.
     ctx.logger.warn(
-      'http-proxy: cannot read the %s settings section (%s); using the built-in model hosts only',
+      'dsh-proxy: cannot read the %s settings section (%s); using the built-in model hosts only',
       PI_AI_NS,
       cause instanceof Error ? cause.message : String(cause),
     )
@@ -190,6 +201,11 @@ export function apply(ctx: Context, config: PluginConfig): void {
   /** The active routing wrapper plus the settings it was built from. */
   let active: { proxyUrl: string; targets: ProxyTargets; entry: ProxyFetch } | undefined
   let disposed = false
+  /**
+   * Whether the last refresh saw a configuration that carries nothing: no
+   * proxy URL (settings or `DSH_HTTP_PROXY`) and no host entries at all.
+   */
+  let vacant = true
 
   const deactivate = (): void => {
     if (active === undefined) return
@@ -201,14 +217,48 @@ export function apply(ctx: Context, config: PluginConfig): void {
     void entry.close().catch(() => { /* a closed dispatcher is the goal */ })
   }
 
+  /**
+   * Take the settings row DSH wrote for this plugin back out of the profile
+   * patch.
+   *
+   * A row that outlives its settings is pure residue: it keeps the profile's
+   * `cordis.patch.yml` dirty, and disabling the plugin cannot remove it,
+   * because DSH only drops the bundle. Failures are logged, never thrown — a
+   * stale row is not worth failing a plugin mount over.
+   * @param why - the trigger, for the log line.
+   */
+  const scrubProfile = (why: string): void => {
+    try {
+      const outcome = pruneProxyEntryFromProfile()
+      if (outcome.removed) {
+        ctx.logger.info(
+          'dsh-proxy: removed the %s settings row from the profile patch (%s, %s)',
+          outcome.id ?? 'dsh-proxy',
+          why,
+          outcome.file,
+        )
+      }
+    } catch (cause) {
+      ctx.logger.warn(
+        'dsh-proxy: could not clean the settings row (%s)',
+        cause instanceof Error ? cause.message : String(cause),
+      )
+    }
+  }
+
   const refresh = (): void => {
     if (disposed) return
     const cfg = readConfig(config)
     // Settings `proxy` wins; the `DSH_HTTP_PROXY` environment variable is the
     // no-file fallback so a deployment can set the proxy without editing settings.
     const proxyUrl = cfg.proxy.length > 0 ? cfg.proxy : (process.env.DSH_HTTP_PROXY ?? '')
+    // Nothing configured at all — no proxy URL, no routed hosts, no
+    // exclusions — means the profile row carries no information, so it goes
+    // back out (see `scrubProfile`). A row that still holds settings stays.
+    vacant = proxyUrl.length === 0 && cfg.proxyHosts.length === 0 && cfg.excludeHosts.length === 0
     if (proxyUrl.length === 0) {
       deactivate()
+      if (vacant) scrubProfile('no proxy URL and no host entries')
       return
     }
     const targets = collectProxyHosts(ctx, cfg)
@@ -224,7 +274,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       entry = createProxyFetch(proxyUrl)
     } catch (cause) {
       ctx.logger.warn(
-        'http-proxy: invalid proxy URL "%s" (%s); routing stays off',
+        'dsh-proxy: invalid proxy URL "%s" (%s); routing stays off',
         proxyUrl,
         cause instanceof Error ? cause.message : String(cause),
       )
@@ -246,6 +296,11 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.effect(() => () => {
     disposed = true
     deactivate()
+    // Turning the plugin off (disable, uninstall, or a profile recomposition)
+    // leaves nothing behind when the configuration was already empty. With
+    // settings still in place the row stays, so mounting the plugin again
+    // restores them.
+    if (vacant) scrubProfile('plugin unloaded with empty settings')
   })
 
   // DSH edits this plugin's configuration in place: the Loader commits the new

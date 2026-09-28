@@ -3,5 +3,5 @@
 # so this row carries no config by default.
 
 - insert:
-    - id: http-proxy
-      name: 'dsh-http-proxy'
+    - id: dsh-proxy
+      name: 'dsh-proxy'

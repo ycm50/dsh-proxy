@@ -1,5 +1,5 @@
 /**
- * `dsh-http-proxy`: route model-API requests through an HTTP/SOCKS proxy
+ * `dsh-proxy`: route model-API requests through an HTTP/SOCKS proxy
  * without modifying DeepSeek Harness source. It wraps `globalThis.fetch` —
  * the transport both the DeepSeek adapter and the pi-ai SDK clients use — and
  * sends only model-API hosts through a proxy dispatcher. Web search, web
@@ -9,7 +9,7 @@
  * place by the settings document, so the running instance re-reads the value
  * on `loader/volatile-update` rather than being remounted. `apply` is
  * therefore installed once and {@link readConfig} is consulted per refresh.
- * @module dsh-http-proxy
+ * @module dsh-proxy
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { PluginConfig } from './config.js';
@@ -17,8 +17,10 @@ export { Config, assertValid, readConfig, SUPPORTED_PROXY_SCHEMES } from './conf
 export type { HttpProxyConfig, PluginConfig } from './config.js';
 export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, createProxyFetch, createRoutingFetch, hostnameOf, matchesHostEntry, normalizeHostEntry, shouldProxy, urlOf, } from './proxy.js';
 export type { ProxyFetch } from './proxy.js';
+export { PROFILE_PATCH_FILE, PROXY_ENTRY_ID, PROXY_IDENTITIES, PROXY_PACKAGE_NAME, profilePatchPath, pruneProxyEntry, pruneProxyEntryFromProfile, } from './profile-patch.js';
+export type { PatchPruneResult, ProxyIdentity, ProxyRowCleanup } from './profile-patch.js';
 /** Plugin short name (also the profile entry id that carries its settings). */
-export declare const name = "http-proxy";
+export declare const name = "dsh-proxy";
 /**
  * Install the routing wrapper. The configuration is re-read per refresh, so a
  * settings change reaches the next request without a restart; an empty `proxy`

@@ -2,7 +2,7 @@
  * Browser-safe hostname helpers shared by the Host half (routing) and the
  * browser card (suggestions). No node imports, so either bundle can inline
  * this module without dragging in `undici`.
- * @module dsh-http-proxy/hosts
+ * @module dsh-proxy/hosts
  */
 
 /** The official DeepSeek adapter's default endpoint host. */

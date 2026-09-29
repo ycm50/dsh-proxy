@@ -17,14 +17,21 @@ export { Config, assertValid, readConfig, SUPPORTED_PROXY_SCHEMES } from './conf
 export type { HttpProxyConfig, PluginConfig } from './config.js';
 export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, createProxyFetch, createRoutingFetch, hostnameOf, matchesHostEntry, normalizeHostEntry, shouldProxy, urlOf, } from './proxy.js';
 export type { ProxyFetch } from './proxy.js';
-export { PROFILE_PATCH_FILE, PROXY_ENTRY_ID, PROXY_IDENTITIES, PROXY_PACKAGE_NAME, profilePatchPath, pruneProxyEntry, pruneProxyEntryFromProfile, } from './profile-patch.js';
-export type { PatchPruneResult, ProxyIdentity, ProxyRowCleanup } from './profile-patch.js';
+export { PROXY_ENV_NAMES, WINDOWS_INTERNET_SETTINGS_KEY, normalizeProxyValue, parseGsettingsValue, parseScutilProxy, parseWindowsProxyServer, parseWindowsRegistry, pickWindowsProxy, readEnvironmentProxy, readMacSystemProxy, readSystemProxy, readWindowsSystemProxy, } from './system-proxy.js';
+export type { ScutilReading, WindowsProxyEntry, WindowsProxyRegistry, } from './system-proxy.js';
+export { SYSTEM_PROXY_CHANNEL, SYSTEM_PROXY_ENDPOINT, SYSTEM_PROXY_ROUTE, } from './rpc-contract.js';
+export type { ClientRequestEnvelope, RpcFailure, RpcResult, ServerResponseEnvelope, SystemProxyReading, SystemProxySource, } from './rpc-contract.js';
+export { installSystemProxyRpc } from './rpc.js';
+export { PROFILE_MANIFEST_FILE, PROFILE_PATCH_FILE, PROXY_ENTRY_ID, PROXY_IDENTITIES, PROXY_PACKAGE_NAME, planRowCleanup, profileDir, profileManifestPath, profilePatchPath, pruneProxyEntry, pruneProxyEntryFromProfile, readBundleSelection, readProxyEntryState, stripProxyEntryConfig, stripProxyEntryConfigFromProfile, } from './profile-patch.js';
+export type { BundleSelection, PatchPruneResult, PatchStripResult, ProxyIdentity, ProxyRowCleanup, ProxyRowState, } from './profile-patch.js';
 /** Plugin short name (also the profile entry id that carries its settings). */
 export declare const name = "dsh-proxy";
 /**
- * Install the routing wrapper. The configuration is re-read per refresh, so a
- * settings change reaches the next request without a restart; an empty `proxy`
- * deactivates routing and restores the platform fetch.
+ * Install the routing wrapper, and the Connection channel that lets the
+ * settings page read this machine's proxy. The configuration is re-read per
+ * refresh, so a settings change reaches the next request without a restart; an
+ * empty `proxy` deactivates routing and restores the platform fetch, and
+ * `useSystemProxy` exchanges the typed address for the machine's own.
  * @param ctx - the Cordis context this plugin mounts into.
  * @param config - the parsed plugin config; its fields are live references.
  */

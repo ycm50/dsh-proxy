@@ -7,8 +7,9 @@
  * bundled settings pages use) holds the drafts, derives each control's
  * effective value and overridden badge from the shared config form, and writes
  * every edit in one revision-fenced `mutate` on save. This module only says how
- * this plugin's three fields convert between stored values and draft text, and
- * where the pick list comes from.
+ * this plugin's four fields convert between stored values and draft text,
+ * where the pick list comes from, and how the page reaches the Host half to ask
+ * what proxy this machine is configured with.
  * @module dsh-proxy/client/form-controller
  */
 
@@ -30,6 +31,9 @@ import {
   normalizeHostEntry,
   splitHostEntries,
 } from '../hosts.js'
+import { SYSTEM_PROXY_CHANNEL, SYSTEM_PROXY_ENDPOINT } from '../rpc-contract.js'
+import type { SystemProxyReading, SystemProxySource } from '../rpc-contract.js'
+import { clientRpc } from './connection.js'
 
 /** The `dsh-proxy` section fields this page edits (the wire shape). */
 export interface HttpProxySettings {
@@ -39,6 +43,8 @@ export interface HttpProxySettings {
   proxyHosts?: string[]
   /** Hostnames never proxied. */
   excludeHosts?: string[]
+  /** Whether the machine's own proxy configuration supplies the address. */
+  useSystemProxy?: boolean
 }
 
 /** The `llm-pi-ai` section subset this page reads for known model gateways. */
@@ -50,7 +56,7 @@ export interface PiAiSettings {
 export type HostFieldName = 'proxyHosts' | 'excludeHosts'
 
 /** One editable field of the page. */
-export type FieldName = 'proxy' | HostFieldName
+export type FieldName = 'proxy' | HostFieldName | 'useSystemProxy'
 
 /**
  * A host-list field: one line of text over a `string[]`.
@@ -74,6 +80,56 @@ function settingsHostListField(field: string): SettingsFieldSpec {
   }
 }
 
+/**
+ * A boolean field: the checkbox holds `"true"`/`"false"` text, and a save
+ * writes the boolean the Host schema declares.
+ *
+ * A checkbox has no third state, so unlike the text fields this one never
+ * clears: unticking stores an explicit `false`, which is what the Host reads
+ * anyway (an absent value defaults to `false`).
+ * @param field - field name inside the namespace section.
+ * @returns the field's conversion spec.
+ */
+function settingsBooleanField(field: string): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (value === true ? 'true' : 'false'),
+    parse: (text) => ({ kind: 'set', value: text.trim().toLowerCase() === 'true' }),
+  }
+}
+
+/** The sources a reading may name, so a wire value outside the union reads as `none`. */
+const SYSTEM_PROXY_SOURCES: readonly SystemProxySource[] = [
+  'windows-registry',
+  'env',
+  'macos-scutil',
+  'linux-gsettings',
+  'none',
+]
+
+/**
+ * Coerce one wire value into a reading.
+ *
+ * The Host owns the shape, so this only defends the page against a Host that is
+ * older, newer, or broken: anything missing reads as an empty field rather than
+ * crashing the render.
+ * @param value - the endpoint's success value.
+ * @returns the reading, or undefined when there is no object to read.
+ */
+function asReading(value: unknown): SystemProxyReading | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Partial<SystemProxyReading>
+  const source = SYSTEM_PROXY_SOURCES.find((candidate) => candidate === record.source) ?? 'none'
+  const pacUrl = typeof record.pacUrl === 'string' && record.pacUrl.length > 0 ? record.pacUrl : undefined
+  return {
+    proxy: typeof record.proxy === 'string' ? record.proxy : '',
+    source,
+    detail: typeof record.detail === 'string' ? record.detail : '',
+    platform: typeof record.platform === 'string' ? record.platform : '',
+    ...(pacUrl === undefined ? {} : { pacUrl }),
+  }
+}
+
 /** What the dsh-proxy settings page renders. */
 export interface HttpProxyFormState extends SettingsFormShell {
   /** Staged proxy URL. */
@@ -82,14 +138,27 @@ export interface HttpProxyFormState extends SettingsFormShell {
   proxyHosts: SettingsFieldState
   /** Staged excluded hosts, comma/whitespace separated. */
   excludeHosts: SettingsFieldState
+  /** Staged "use the system proxy" switch. */
+  useSystemProxy: SettingsFieldState
   /** Known model hostnames offered beside the host fields (free text still allowed). */
   suggestions: string[]
 }
+
+/** One answer to the page's "read the system proxy" request. */
+export type SystemProxyRead =
+  | { status: 'ok'; reading: SystemProxyReading }
+  | { status: 'unavailable' }
+  | { status: 'failed'; message: string }
 
 /** The registration-side face the settings section injects. */
 export interface HttpProxyFormFace extends SettingsFormActions {
   /** Form snapshot bound by the renderer as useHttpProxyForm. */
   hooks: { httpProxyForm: SnapshotStore<HttpProxyFormState> }
+  /**
+   * Ask the Host half for this machine's proxy configuration. Never rejects:
+   * a deployment without a Connection channel answers `unavailable`.
+   */
+  readSystemProxy(): Promise<SystemProxyRead>
 }
 
 /** Bridges the `dsh-proxy` config form onto the settings page. */
@@ -105,7 +174,7 @@ export class HttpProxyFormController {
    * @param knownNs - namespace whose configured gateways feed the pick list.
    */
   constructor(
-    ctx: ClientContext,
+    private readonly ctx: ClientContext,
     private readonly scope: ConfigForm<HttpProxySettings>,
     private readonly knownNs: string,
   ) {
@@ -113,6 +182,7 @@ export class HttpProxyFormController {
       settingsTextField('proxy'),
       settingsHostListField('proxyHosts'),
       settingsHostListField('excludeHosts'),
+      settingsBooleanField('useSystemProxy'),
     ])
     // The shared mirror is the one `settings.describe` reader in the browser;
     // reading the `llm-pi-ai` gateways through it keeps this page from opening
@@ -138,8 +208,35 @@ export class HttpProxyFormController {
   inject(): HttpProxyFormFace {
     return {
       hooks: { httpProxyForm: this.store },
+      readSystemProxy: () => this.readSystemProxy(),
       ...this.form.actions(),
     }
+  }
+
+  /**
+   * Ask the Host half what proxy this machine is configured with.
+   *
+   * The browser cannot read a registry, so the checkbox is a round trip: the
+   * answer either carries a reading the page fills its field from, or says why
+   * there is none. Nothing here throws — the page shows the failure and leaves
+   * the form alone.
+   * @returns the reading, or why there is none.
+   */
+  private async readSystemProxy(): Promise<SystemProxyRead> {
+    const rpc = clientRpc(this.ctx)
+    if (rpc === undefined) return { status: 'unavailable' }
+    let value: unknown
+    try {
+      const result = await rpc.call(SYSTEM_PROXY_CHANNEL, SYSTEM_PROXY_ENDPOINT, {})
+      if (!result.ok) return { status: 'failed', message: result.error.message }
+      value = result.value
+    } catch (cause) {
+      return { status: 'failed', message: cause instanceof Error ? cause.message : String(cause) }
+    }
+    const reading = asReading(value)
+    return reading === undefined
+      ? { status: 'failed', message: 'the Host returned no reading' }
+      : { status: 'ok', reading }
   }
 
   private publish(): void {
@@ -152,6 +249,7 @@ export class HttpProxyFormController {
       proxy: this.form.field('proxy'),
       proxyHosts: this.form.field('proxyHosts'),
       excludeHosts: this.form.field('excludeHosts'),
+      useSystemProxy: this.form.field('useSystemProxy'),
       suggestions: this.suggestions(),
     }
   }

@@ -73,6 +73,7 @@ check('bundle exposes a factory', typeof registration?.factory === 'function')
 
 // The seed module table the shell installs before any bundle runs.
 const seed = {
+  react: await import('react'),
   'react/jsx-runtime': await import('react/jsx-runtime'),
   '@deepseek-ai/dsh-client-ui-primitives': await import('@deepseek-ai/dsh-client-ui-primitives'),
 }
@@ -115,8 +116,30 @@ const mirror = {
   ensure: async () => {},
   acceptView: () => {},
 }
+// The Host half is reached through the browser `connection` service's generic
+// RPC caller, so the stub records what the page asks and answers like this
+// plugin's own Host half would.
+const rpcCalls = []
+const connection = {
+  rpc: {
+    async call(channel, endpoint, payload) {
+      rpcCalls.push({ channel, endpoint, payload })
+      return {
+        ok: true,
+        value: {
+          proxy: 'http://127.0.0.1:10808',
+          source: 'windows-registry',
+          detail: 'Windows Internet Settings: 127.0.0.1:10808',
+          platform: 'win32',
+        },
+      }
+    },
+  },
+}
+
 const ctx = {
   effect(fn) { fn(); return () => {} },
+  get(name) { return name === 'connection' ? connection : undefined },
   locale: {
     bind(ns) { boundNamespace = ns; return (key) => `«${key}»` },
     register(ns, dicts) { registeredDictionaries = { ns, dicts }; return () => {} },
@@ -181,7 +204,21 @@ check('page renders both host fields', page.includes('dsh-proxy-hosts') && page.
 check('page renders the stored host list as text', page.includes('gateway.acme.example'))
 check('page offers the known-host pick list', page.includes('«suggestions»'))
 check('page marks the saved proxy overridden', page.includes('«overridden»'))
-check('page renders three inputs', (page.match(/<input/g) ?? []).length === 3, String((page.match(/<input/g) ?? []).length))
+check('page renders four inputs', (page.match(/<input/g) ?? []).length === 4, String((page.match(/<input/g) ?? []).length))
+check('page renders the system-proxy switch', page.includes('type="checkbox"') && page.includes('«useSystemProxy»'))
+
+// The switch's reading is a round trip to this plugin's own Host channel: the
+// page asks for it, and fills the address field from the answer.
+const read = await face.readSystemProxy()
+check('reads the system proxy on the shared browser carrier',
+  rpcCalls[0]?.channel === '/api' && rpcCalls[0]?.endpoint === 'dsh-proxy/system-proxy', JSON.stringify(rpcCalls[0]))
+check('passes the Host reading through', read.status === 'ok' && read.reading.proxy === 'http://127.0.0.1:10808'
+  && read.reading.source === 'windows-registry', JSON.stringify(read))
+const withoutConnection = connection.rpc
+connection.rpc = undefined
+const unavailable = await face.readSystemProxy()
+connection.rpc = withoutConnection
+check('a deployment without Connection reports unavailable', unavailable.status === 'unavailable', JSON.stringify(unavailable))
 if (process.env.SMOKE_HTML) console.log(`\n--- rendered page ---\n${page.replace(/></g, '>\n<')}\n--- end ---\n`)
 
 // The host field's text must round-trip through the shared form model, and a

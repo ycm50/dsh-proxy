@@ -11,9 +11,11 @@
  * @module dsh-proxy/client/section
  */
 
+import { useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
-import { Button, SettingsForm, SettingsValueField } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Checkbox, SettingsForm, SettingsValueField } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsFieldState, SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { SystemProxySource } from '../rpc-contract.js'
 import type { HttpProxySectionProps, HttpProxyTranslate } from './contract.js'
 import type { HostFieldName } from './form-controller.js'
 import { matchesHostEntry, normalizeHostEntry, splitHostEntries } from '../hosts.js'
@@ -129,6 +131,53 @@ function HostField(props: {
 }
 
 /**
+ * Name the mechanism a reading came from, in the active locale.
+ * @param t - this page's translate function.
+ * @param source - the reading's source.
+ * @returns one short phrase to append to the status line.
+ */
+function sourceLabel(t: HttpProxyTranslate, source: SystemProxySource): string {
+  switch (source) {
+    case 'windows-registry': return t('systemProxyFromWindows')
+    case 'env': return t('systemProxyFromEnv')
+    case 'macos-scutil': return t('systemProxyFromMacos')
+    case 'linux-gsettings': return t('systemProxyFromLinux')
+    default: return t('systemProxyFromNone')
+  }
+}
+
+/**
+ * The "use the system proxy" switch and the line reporting what reading it
+ * produced.
+ *
+ * The switch is a staged field like every other control on the page, but the
+ * reading it triggers is immediate: the Host is asked as soon as the box is
+ * ticked, and the answer drafts the address field above it, ready for the same
+ * save. The status line is page-local state — it describes one attempt, not a
+ * setting.
+ */
+function SystemProxyControl(props: {
+  t: HttpProxyTranslate
+  state: SettingsFieldState
+  disabled: boolean
+  status: string | undefined
+  onToggle: (checked: boolean) => void
+}): ReactElement {
+  return (
+    <div className={css.systemProxy}>
+      <Checkbox
+        checked={props.state.text === 'true'}
+        disabled={props.disabled}
+        label={props.t('useSystemProxy')}
+        onChange={props.onToggle}
+      />
+      <p className={css.hint}>{props.t('useSystemProxyHint')}</p>
+      {props.status !== undefined ? <p className={css.status} role="status">{props.status}</p> : null}
+    </div>
+  )
+}
+
+/**
  * Render the dsh-proxy settings page.
  * @param props - locale copy, the page snapshot, and its form actions.
  * @returns the page column.
@@ -137,6 +186,43 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
   const { t } = props
   const state = props.useHttpProxyForm(snapshot => snapshot)
   const disabled = !state.writable
+  /** What the last attempt to read the system proxy reported. */
+  const [status, setStatus] = useState<string | undefined>(undefined)
+
+  /**
+   * Stage the switch, and — when it is being turned on — read the machine's
+   * proxy and draft the address field with it.
+   *
+   * Unticking only stages the switch: an address already on screen is the
+   * user's to keep or clear, never something this control deletes.
+   * @param checked - the box's requested state.
+   */
+  const toggleSystemProxy = async (checked: boolean): Promise<void> => {
+    props.edit('useSystemProxy', checked ? 'true' : 'false')
+    if (!checked) {
+      setStatus(undefined)
+      return
+    }
+    setStatus(t('systemProxyReading'))
+    const outcome = await props.readSystemProxy()
+    if (outcome.status === 'unavailable') {
+      setStatus(t('systemProxyUnavailable'))
+      return
+    }
+    if (outcome.status === 'failed') {
+      setStatus(`${t('systemProxyFailed')}: ${outcome.message}`)
+      return
+    }
+    const { reading } = outcome
+    if (reading.proxy.length === 0) {
+      setStatus(reading.pacUrl === undefined
+        ? t('systemProxyNone')
+        : `${t('systemProxyPac')}: ${reading.pacUrl}`)
+      return
+    }
+    props.edit('proxy', reading.proxy)
+    setStatus(`${t('systemProxyDetected')}: ${reading.proxy} · ${sourceLabel(t, reading.source)}`)
+  }
   const hostField = (field: HostFieldName, id: string, label: string, hint: string): ReactElement => (
     <HostField
       t={t}
@@ -173,6 +259,13 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
           {...state.proxy}
           onEdit={text => { props.edit('proxy', text) }}
           onReset={() => { props.resetField('proxy') }}
+        />
+        <SystemProxyControl
+          t={t}
+          state={state.useSystemProxy}
+          disabled={disabled}
+          status={status}
+          onToggle={checked => { void toggleSystemProxy(checked) }}
         />
         {hostField('proxyHosts', 'dsh-proxy-hosts', t('hosts'), t('hostsHint'))}
         {hostField('excludeHosts', 'dsh-proxy-exclude', t('exclude'), t('excludeHint'))}

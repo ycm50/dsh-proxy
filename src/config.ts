@@ -47,6 +47,13 @@ export interface HttpProxyConfig {
   proxyHosts: string[]
   /** Hostnames that must never be routed, even when auto-detected or listed. */
   excludeHosts: string[]
+  /**
+   * Whether to take the proxy address from the operating system instead of the
+   * typed one. When set, the machine's own configuration is read for every
+   * routing decision, and `proxy` is only the fallback for a machine that has
+   * nothing configured.
+   */
+  useSystemProxy: boolean
 }
 
 /** Runtime schema for the plugin entry; also the settings page's form. */
@@ -54,6 +61,7 @@ export const Config = z.object({
   proxy: z.string().default('').volatile(),
   proxyHosts: z.array(z.string()).default([]).volatile(),
   excludeHosts: z.array(z.string()).default([]).volatile(),
+  useSystemProxy: z.boolean().default(false).volatile(),
 })
 
 /**
@@ -80,6 +88,7 @@ export function readConfig(config: PluginConfig): HttpProxyConfig {
     proxy: typeof proxy === 'string' ? proxy : '',
     proxyHosts: hostList(config.proxyHosts.get()),
     excludeHosts: hostList(config.excludeHosts.get()),
+    useSystemProxy: config.useSystemProxy.get() === true,
   }
 }
 

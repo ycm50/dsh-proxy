@@ -36,6 +36,7 @@ check('empty proxy', readConfig(empty).proxy, '')
 check('empty proxyHosts', readConfig(empty).proxyHosts, [])
 check('empty excludeHosts', readConfig(empty).excludeHosts, [])
 check('fields are volatile references', typeof empty.proxy.get, 'function')
+check('useSystemProxy rests at false', readConfig(empty).useSystemProxy, false)
 
 const parsed = Config({
   proxy: 'socks5://127.0.0.1:7890',
@@ -45,6 +46,8 @@ const parsed = Config({
 check('proxy', readConfig(parsed).proxy, 'socks5://127.0.0.1:7890')
 check('proxyHosts', readConfig(parsed).proxyHosts, ['gateway.acme.example', '.aiplatform.googleapis.com'])
 check('excludeHosts', readConfig(parsed).excludeHosts, ['api.deepseek.com'])
+check('a section without the switch reads as off', readConfig(parsed).useSystemProxy, false)
+check('the system-proxy switch is read back', readConfig(Config({ useSystemProxy: true })).useSystemProxy, true)
 
 // --- 2. Entries are umbrellas: a domain covers its whole subtree ------------
 check('a plain domain normalizes to itself', normalizeHostEntry('commandcode.ai'), 'commandcode.ai')

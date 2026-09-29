@@ -30,7 +30,10 @@ import {
   normalizeHostEntry,
 } from './proxy.js'
 import type { ProxyFetch } from './proxy.js'
-import { pruneProxyEntryFromProfile } from './profile-patch.js'
+import { planRowCleanup, pruneProxyEntryFromProfile, stripProxyEntryConfigFromProfile } from './profile-patch.js'
+import { installSystemProxyRpc } from './rpc.js'
+import type { SystemProxyReading } from './rpc-contract.js'
+import { readSystemProxy } from './system-proxy.js'
 
 export { Config, assertValid, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js'
 export type { HttpProxyConfig, PluginConfig } from './config.js'
@@ -48,15 +51,63 @@ export {
 } from './proxy.js'
 export type { ProxyFetch } from './proxy.js'
 export {
+  PROXY_ENV_NAMES,
+  WINDOWS_INTERNET_SETTINGS_KEY,
+  normalizeProxyValue,
+  parseGsettingsValue,
+  parseScutilProxy,
+  parseWindowsProxyServer,
+  parseWindowsRegistry,
+  pickWindowsProxy,
+  readEnvironmentProxy,
+  readMacSystemProxy,
+  readSystemProxy,
+  readWindowsSystemProxy,
+} from './system-proxy.js'
+export type {
+  ScutilReading,
+  WindowsProxyEntry,
+  WindowsProxyRegistry,
+} from './system-proxy.js'
+export {
+  SYSTEM_PROXY_CHANNEL,
+  SYSTEM_PROXY_ENDPOINT,
+  SYSTEM_PROXY_ROUTE,
+} from './rpc-contract.js'
+export type {
+  ClientRequestEnvelope,
+  RpcFailure,
+  RpcResult,
+  ServerResponseEnvelope,
+  SystemProxyReading,
+  SystemProxySource,
+} from './rpc-contract.js'
+export { installSystemProxyRpc } from './rpc.js'
+export {
+  PROFILE_MANIFEST_FILE,
   PROFILE_PATCH_FILE,
   PROXY_ENTRY_ID,
   PROXY_IDENTITIES,
   PROXY_PACKAGE_NAME,
+  planRowCleanup,
+  profileDir,
+  profileManifestPath,
   profilePatchPath,
   pruneProxyEntry,
   pruneProxyEntryFromProfile,
+  readBundleSelection,
+  readProxyEntryState,
+  stripProxyEntryConfig,
+  stripProxyEntryConfigFromProfile,
 } from './profile-patch.js'
-export type { PatchPruneResult, ProxyIdentity, ProxyRowCleanup } from './profile-patch.js'
+export type {
+  BundleSelection,
+  PatchPruneResult,
+  PatchStripResult,
+  ProxyIdentity,
+  ProxyRowCleanup,
+  ProxyRowState,
+} from './profile-patch.js'
 
 /** Plugin short name (also the profile entry id that carries its settings). */
 export const name = 'dsh-proxy'
@@ -190,9 +241,11 @@ function sameTargets(left: ProxyTargets, right: ProxyTargets): boolean {
 }
 
 /**
- * Install the routing wrapper. The configuration is re-read per refresh, so a
- * settings change reaches the next request without a restart; an empty `proxy`
- * deactivates routing and restores the platform fetch.
+ * Install the routing wrapper, and the Connection channel that lets the
+ * settings page read this machine's proxy. The configuration is re-read per
+ * refresh, so a settings change reaches the next request without a restart; an
+ * empty `proxy` deactivates routing and restores the platform fetch, and
+ * `useSystemProxy` exchanges the typed address for the machine's own.
  * @param ctx - the Cordis context this plugin mounts into.
  * @param config - the parsed plugin config; its fields are live references.
  */
@@ -203,7 +256,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
   let disposed = false
   /**
    * Whether the last refresh saw a configuration that carries nothing: no
-   * proxy URL (settings or `DSH_HTTP_PROXY`) and no host entries at all.
+   * proxy URL (settings, the system, or `DSH_HTTP_PROXY`), no host entries, and
+   * no system-proxy switch.
    */
   let vacant = true
 
@@ -246,19 +300,113 @@ export function apply(ctx: Context, config: PluginConfig): void {
     }
   }
 
+  /**
+   * Take this plugin's settings out of the profile patch, leaving the row and
+   * its other keys in place.
+   *
+   * This is what a switch-off through DSH's per-entry key gets: the row must
+   * stay, because it carries the `disabled: true` that keeps the entry off, and
+   * only its `config` goes (see `stripProxyEntryConfig`).
+   * @param why - the trigger, for the log line.
+   */
+  const stripSettings = (why: string): void => {
+    try {
+      const outcome = stripProxyEntryConfigFromProfile()
+      if (outcome.removed) {
+        ctx.logger.info(
+          'dsh-proxy: took the %s settings out of the profile patch, keeping its disabled marker (%s, %s)',
+          outcome.id ?? 'dsh-proxy',
+          why,
+          outcome.file,
+        )
+      }
+    } catch (cause) {
+      ctx.logger.warn(
+        'dsh-proxy: could not clear the settings in the profile patch (%s)',
+        cause instanceof Error ? cause.message : String(cause),
+      )
+    }
+  }
+
+  /**
+   * The last system-proxy outcome this instance logged, so a settings edit
+   * that does not move the reading does not repeat the line.
+   */
+  let lastSystemReport = ''
+
+  /**
+   * Log what the machine's proxy turned out to be, once per distinct outcome.
+   * @param system - the reading.
+   * @param active - the proxy URL routing actually uses after fallbacks.
+   */
+  const reportSystemProxy = (system: SystemProxyReading, active: string): void => {
+    const report = `${system.source}|${system.proxy}|${active}`
+    if (report === lastSystemReport) return
+    lastSystemReport = report
+    if (system.proxy.length > 0) {
+      ctx.logger.info('dsh-proxy: using the system proxy %s (%s)', system.proxy, system.detail)
+    } else if (active.length > 0) {
+      ctx.logger.info('dsh-proxy: no system proxy was found (%s); using %s', system.detail, active)
+    } else {
+      ctx.logger.warn(
+        'dsh-proxy: the system proxy was requested but none was found (%s); routing stays off',
+        system.detail,
+      )
+    }
+  }
+
+  /**
+   * Run the profile cleanup the current state calls for, if any.
+   *
+   * Both moments that clean the profile — the settings becoming empty while the
+   * plugin runs, and the fiber unloading — ask {@link planRowCleanup} first,
+   * because deleting a row DSH marked `disabled: true` would re-enable the
+   * entry its bundle inserts.
+   * @param trigger - where the cleanup came from, for the log line.
+   */
+  const cleanProfileIfOff = (trigger: string): void => {
+    let plan: ReturnType<typeof planRowCleanup>
+    try {
+      plan = planRowCleanup(vacant)
+    } catch (cause) {
+      ctx.logger.warn(
+        'dsh-proxy: could not read the profile (%s)',
+        cause instanceof Error ? cause.message : String(cause),
+      )
+      return
+    }
+    if (plan === undefined) return
+    if (plan.mode === 'remove') scrubProfile(`${trigger}: ${plan.reason}`)
+    else stripSettings(`${trigger}: ${plan.reason}`)
+  }
+
   const refresh = (): void => {
     if (disposed) return
     const cfg = readConfig(config)
-    // Settings `proxy` wins; the `DSH_HTTP_PROXY` environment variable is the
-    // no-file fallback so a deployment can set the proxy without editing settings.
-    const proxyUrl = cfg.proxy.length > 0 ? cfg.proxy : (process.env.DSH_HTTP_PROXY ?? '')
+    // With "use the system proxy" on, the machine's own configuration is the
+    // address: it is read here, so ticking the switch (or replacing the system
+    // proxy and reloading the plugin) reaches the next request without a
+    // restart. The typed address is the fallback for a machine that has no
+    // system proxy, and `DSH_HTTP_PROXY` is the no-file fallback so a
+    // deployment can set the proxy without editing settings.
+    const system = cfg.useSystemProxy ? readSystemProxy() : undefined
+    const detected = system?.proxy ?? ''
+    const proxyUrl = detected.length > 0
+      ? detected
+      : (cfg.proxy.length > 0 ? cfg.proxy : (process.env.DSH_HTTP_PROXY ?? ''))
+    if (system !== undefined) reportSystemProxy(system, proxyUrl)
     // Nothing configured at all — no proxy URL, no routed hosts, no
-    // exclusions — means the profile row carries no information, so it goes
-    // back out (see `scrubProfile`). A row that still holds settings stays.
+    // exclusions, no system-proxy switch — means the profile row carries no
+    // information, so it goes back out (see `scrubProfile`). A row that still
+    // holds settings stays.
     vacant = proxyUrl.length === 0 && cfg.proxyHosts.length === 0 && cfg.excludeHosts.length === 0
+      && !cfg.useSystemProxy
     if (proxyUrl.length === 0) {
       deactivate()
-      if (vacant) scrubProfile('no proxy URL and no host entries')
+      // Nothing to route with: with the settings empty too, the row carries
+      // nothing, so it goes — unless DSH's own state says this entry is
+      // switched off, in which case the marker has to stay.
+      if (vacant) cleanProfileIfOff('cleared settings')
       return
     }
     const targets = collectProxyHosts(ctx, cfg)
@@ -293,14 +441,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }
 
   refresh()
+  // The settings page's "use the system proxy" switch reads the machine through
+  // this plugin's own Connection channel; a composition without one simply
+  // never installs it.
+  installSystemProxyRpc(ctx)
   ctx.effect(() => () => {
     disposed = true
     deactivate()
-    // Turning the plugin off (disable, uninstall, or a profile recomposition)
-    // leaves nothing behind when the configuration was already empty. With
-    // settings still in place the row stays, so mounting the plugin again
-    // restores them.
-    if (vacant) scrubProfile('plugin unloaded with empty settings')
+    // An unload is not by itself a switch-off: a restart, an HMR reload, and an
+    // update tear the fiber down the same way, and paying for that with the
+    // user's settings would be worse than leaving the row. `planRowCleanup`
+    // reads DSH's own persistent state to tell the two apart — a bundle the
+    // profile no longer selects, or a row carrying `disabled: true`.
+    cleanProfileIfOff('plugin unloaded')
   })
 
   // DSH edits this plugin's configuration in place: the Loader commits the new

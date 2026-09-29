@@ -27,3 +27,30 @@
   margin: 0;
   font-size: 13px;
 }
+
+/* The system-proxy switch reads as a boxed aside beside the address field it
+   fills: the switch itself is the host's own checkbox, the copy underneath
+   explains the round trip, and the status line reports the last attempt. */
+.systemProxy {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.hint {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.status {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}

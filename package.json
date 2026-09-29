@@ -1,7 +1,7 @@
 {
   "name": "dsh-proxy",
   "description": "Route DeepSeek Harness model-API requests through an HTTP/SOCKS proxy without modifying Harness source",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -47,7 +47,7 @@
     "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && tsdown",
     "prepublishOnly": "pnpm build",
     "typecheck": "tsc --noEmit",
-    "test": "node test/profile-patch-test.mjs && node test/host-smoke.mjs && node --import ./test/register-hook.mjs test/client-smoke.mjs"
+    "test": "node test/profile-patch-test.mjs && node test/unload-cleanup-test.mjs && node test/host-smoke.mjs && node test/system-proxy-test.mjs && node --import ./test/register-hook.mjs test/client-smoke.mjs"
   },
   "dsh": {
     "bundle": {

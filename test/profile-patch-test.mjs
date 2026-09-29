@@ -10,13 +10,20 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  PROFILE_MANIFEST_FILE,
   PROFILE_PATCH_FILE,
   PROXY_ENTRY_ID,
   PROXY_IDENTITIES,
   PROXY_PACKAGE_NAME,
+  planRowCleanup,
+  profileManifestPath,
   profilePatchPath,
   pruneProxyEntry,
   pruneProxyEntryFromProfile,
+  readBundleSelection,
+  readProxyEntryState,
+  stripProxyEntryConfig,
+  stripProxyEntryConfigFromProfile,
 } from '../lib/profile-patch.js'
 
 let failures = 0
@@ -188,6 +195,100 @@ check(
   PROXY_IDENTITIES.some((i) => i.id === 'http-proxy' && i.name === 'dsh-http-proxy'),
   true,
 )
+
+
+// --- 10. Reading the switch-off signals the unload policy acts on ----------
+// DSH writes \`disabled: true\` into the row to switch one entry off, and drops
+// the bundle from \`dsh.profile.bundles\` to switch a bundle off; an unload alone
+// means nothing, because a reload tears the fiber down the same way.
+check('a plain row reads as enabled', readProxyEntryState(PATCH), 'enabled')
+check('a missing row reads as absent', readProxyEntryState('- id: keep\n  name: keep\n'), 'absent')
+check(
+  'a foreign row under our id is not ours',
+  readProxyEntryState('- id: dsh-proxy\n  name: someone-elses-proxy\n  disabled: true\n'),
+  'absent',
+)
+const DISABLED_ROW = [
+  '- id: dsh-proxy',
+  '  name: dsh-proxy',
+  '  disabled: true',
+  '  config:',
+  '    proxy: http://127.0.0.1:10808',
+  '',
+].join('\n')
+check('a disabled row reads as disabled', readProxyEntryState(DISABLED_ROW), 'disabled')
+check('disabled: false is not disabled', readProxyEntryState(DISABLED_ROW.replace('true', 'false')), 'enabled')
+
+// --- 11. Taking the settings out while keeping the marker ------------------
+// The row keeps its `disabled` marker; the config block, and only it, goes.
+const DISABLED_NEIGHBOURED = [
+  '# Your patch layer for this dsh profile',
+  '- id: dsh-proxy',
+  '  name: dsh-proxy',
+  '  disabled: true',
+  '  config:',
+  '    proxy: http://127.0.0.1:10808',
+  '    proxyHosts:',
+  '      - commandcode.ai',
+  '- id: keep',
+  '  name: keep',
+  '',
+].join('\n')
+const strippedText = [
+  '# Your patch layer for this dsh profile',
+  '- id: dsh-proxy',
+  '  name: dsh-proxy',
+  '  disabled: true',
+  '- id: keep',
+  '  name: keep',
+  '',
+].join('\n')
+const stripped = stripProxyEntryConfig(DISABLED_NEIGHBOURED)
+check('config dropped', stripped.changed, true)
+check('strip reason', stripped.reason, 'stripped')
+check('marker and neighbours survive', stripped.text, strippedText)
+check('strip is idempotent', stripProxyEntryConfig(stripped.text).changed, false)
+check('strip reports no-config', stripProxyEntryConfig(stripped.text).reason, 'no-config')
+check('strip leaves a foreign row alone', stripProxyEntryConfig('- id: dsh-proxy\n  name: other\n  config: {}\n').changed, false)
+check('strip reports an absent row', stripProxyEntryConfig('- id: keep\n  name: keep\n').reason, 'absent')
+
+// --- 12. The bundle selection, and the cleanup plan it feeds ---------------
+const planDir = mkdtempSync(join(tmpdir(), 'dsh-proxy-plan-'))
+try {
+  writeFileSync(join(planDir, PROFILE_PATCH_FILE), DISABLED_ROW, 'utf8')
+  const env = { DSH_PROFILE_DIR: planDir }
+  check('manifest path', profileManifestPath(env), join(planDir, PROFILE_MANIFEST_FILE))
+  check('no manifest is unknown', readBundleSelection(env), 'unknown')
+  writeFileSync(join(planDir, PROFILE_MANIFEST_FILE), JSON.stringify({ dsh: { profile: { bundles: ['dsh-base'] } } }), 'utf8')
+  check('a manifest without our bundle is deselected', readBundleSelection(env), 'deselected')
+  check('a deselected bundle removes the row', planRowCleanup(false, env), {
+    mode: 'remove',
+    reason: 'the profile no longer selects this plugin bundle',
+  })
+  writeFileSync(join(planDir, PROFILE_MANIFEST_FILE), JSON.stringify({ dsh: { profile: { bundles: ['dsh-proxy'] } } }), 'utf8')
+  check('a selected bundle keeps the settings', readBundleSelection(env), 'selected')
+  check('a disabled row strips the settings', planRowCleanup(false, env), {
+    mode: 'strip-config',
+    reason: 'the profile switches this plugin entry off',
+  })
+  writeFileSync(join(planDir, PROFILE_PATCH_FILE), PATCH, 'utf8')
+  check('an enabled row with settings is left alone', planRowCleanup(false, env), undefined)
+  check('an enabled row with empty settings is removed', planRowCleanup(true, env), {
+    mode: 'remove',
+    reason: 'unloaded with empty settings',
+  })
+
+  // ...and the strip the plan asks for lands on disk.
+  writeFileSync(join(planDir, PROFILE_PATCH_FILE), DISABLED_ROW, 'utf8')
+  const stripOutcome = stripProxyEntryConfigFromProfile(env)
+  check('strip reports the file', stripOutcome.file, join(planDir, PROFILE_PATCH_FILE))
+  check('strip reports what it did', stripOutcome.reason, 'stripped')
+  check('strip wrote the marker-only row', readFileSync(join(planDir, PROFILE_PATCH_FILE), 'utf8'), '- id: dsh-proxy\n  name: dsh-proxy\n  disabled: true\n')
+  check('second strip changes nothing', stripProxyEntryConfigFromProfile(env).removed, false)
+  check('a missing patch reports', stripProxyEntryConfigFromProfile({ DSH_PROFILE_DIR: join(planDir, 'nowhere') }).reason, 'no-patch-file')
+} finally {
+  rmSync(planDir, { recursive: true, force: true })
+}
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
 process.exit(failures === 0 ? 0 : 1)

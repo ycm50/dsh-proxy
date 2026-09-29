@@ -37,16 +37,25 @@ export interface HttpProxyConfig {
     proxyHosts: string[];
     /** Hostnames that must never be routed, even when auto-detected or listed. */
     excludeHosts: string[];
+    /**
+     * Whether to take the proxy address from the operating system instead of the
+     * typed one. When set, the machine's own configuration is read for every
+     * routing decision, and `proxy` is only the fallback for a machine that has
+     * nothing configured.
+     */
+    useSystemProxy: boolean;
 }
 /** Runtime schema for the plugin entry; also the settings page's form. */
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     proxy: z<string, string, "volatile-defined">;
     proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+    useSystemProxy: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     proxy: z<string, string, "volatile-defined">;
     proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+    useSystemProxy: z<boolean, boolean, "volatile-defined">;
 }>>, "plain">;
 /**
  * Parsed configuration as the Loader hands it to `apply`.

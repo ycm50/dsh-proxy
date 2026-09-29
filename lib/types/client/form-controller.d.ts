@@ -7,14 +7,16 @@
  * bundled settings pages use) holds the drafts, derives each control's
  * effective value and overridden badge from the shared config form, and writes
  * every edit in one revision-fenced `mutate` on save. This module only says how
- * this plugin's three fields convert between stored values and draft text, and
- * where the pick list comes from.
+ * this plugin's four fields convert between stored values and draft text,
+ * where the pick list comes from, and how the page reaches the Host half to ask
+ * what proxy this machine is configured with.
  * @module dsh-proxy/client/form-controller
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis';
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store';
 import type { SettingsFieldState, SettingsFormActions, SettingsFormShell } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client';
+import type { SystemProxyReading } from '../rpc-contract.js';
 /** The `dsh-proxy` section fields this page edits (the wire shape). */
 export interface HttpProxySettings {
     /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
@@ -23,6 +25,8 @@ export interface HttpProxySettings {
     proxyHosts?: string[];
     /** Hostnames never proxied. */
     excludeHosts?: string[];
+    /** Whether the machine's own proxy configuration supplies the address. */
+    useSystemProxy?: boolean;
 }
 /** The `llm-pi-ai` section subset this page reads for known model gateways. */
 export interface PiAiSettings {
@@ -33,7 +37,7 @@ export interface PiAiSettings {
 /** The two host-list fields, which share one control shape. */
 export type HostFieldName = 'proxyHosts' | 'excludeHosts';
 /** One editable field of the page. */
-export type FieldName = 'proxy' | HostFieldName;
+export type FieldName = 'proxy' | HostFieldName | 'useSystemProxy';
 /** What the dsh-proxy settings page renders. */
 export interface HttpProxyFormState extends SettingsFormShell {
     /** Staged proxy URL. */
@@ -42,18 +46,36 @@ export interface HttpProxyFormState extends SettingsFormShell {
     proxyHosts: SettingsFieldState;
     /** Staged excluded hosts, comma/whitespace separated. */
     excludeHosts: SettingsFieldState;
+    /** Staged "use the system proxy" switch. */
+    useSystemProxy: SettingsFieldState;
     /** Known model hostnames offered beside the host fields (free text still allowed). */
     suggestions: string[];
 }
+/** One answer to the page's "read the system proxy" request. */
+export type SystemProxyRead = {
+    status: 'ok';
+    reading: SystemProxyReading;
+} | {
+    status: 'unavailable';
+} | {
+    status: 'failed';
+    message: string;
+};
 /** The registration-side face the settings section injects. */
 export interface HttpProxyFormFace extends SettingsFormActions {
     /** Form snapshot bound by the renderer as useHttpProxyForm. */
     hooks: {
         httpProxyForm: SnapshotStore<HttpProxyFormState>;
     };
+    /**
+     * Ask the Host half for this machine's proxy configuration. Never rejects:
+     * a deployment without a Connection channel answers `unavailable`.
+     */
+    readSystemProxy(): Promise<SystemProxyRead>;
 }
 /** Bridges the `dsh-proxy` config form onto the settings page. */
 export declare class HttpProxyFormController {
+    private readonly ctx;
     private readonly scope;
     private readonly knownNs;
     private readonly form;
@@ -73,6 +95,16 @@ export declare class HttpProxyFormController {
      * @returns the page's snapshot and its form actions.
      */
     inject(): HttpProxyFormFace;
+    /**
+     * Ask the Host half what proxy this machine is configured with.
+     *
+     * The browser cannot read a registry, so the checkbox is a round trip: the
+     * answer either carries a reading the page fills its field from, or says why
+     * there is none. Nothing here throws — the page shows the failure and leaves
+     * the form alone.
+     * @returns the reading, or why there is none.
+     */
+    private readSystemProxy;
     private publish;
     private projection;
     /**

@@ -123,7 +123,24 @@ try {
   first.unload()
   check('unloading after an edit restores the platform fetch', globalThis.fetch === platformFetch)
 
-  // --- 7. A wrapper that never replaced ours is not ours to undo ------------
+  // --- 7. An address that stops being usable retires the wrapper ------------
+  // `refresh` drops the wrapper before judging the new address, so a value it
+  // then rejects must not leave a retired wrapper installed — or a stack entry
+  // that nothing will ever pop.
+  process.env.DSH_PROFILE_DIR = profileA
+  const toInvalid = { ...base }
+  apply(first.ctx, config(toInvalid))
+  check('a valid address installs a wrapper', globalThis.fetch !== platformFetch)
+  toInvalid.proxy = 'notaurl'
+  first.fire()
+  check('an address it rejects retires the wrapper', globalThis.fetch === platformFetch)
+  toInvalid.proxy = 'http://127.0.0.1:10811'
+  first.fire()
+  check('a usable address installs one again', globalThis.fetch !== platformFetch)
+  first.unload()
+  check('and unload still restores the platform fetch', globalThis.fetch === platformFetch)
+
+  // --- 8. A wrapper that never replaced ours is not ours to undo ------------
   process.env.DSH_PROFILE_DIR = profileA
   apply(first.ctx, config({ ...base }))
   const thirdParty = (() => platformFetch)

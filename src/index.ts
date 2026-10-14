@@ -18,15 +18,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-settings'
 // Type-only: declares the `loader/volatile-update` event below.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
-import { assertValid, Config, readConfig } from './config.js'
+import { assertValid, Config, isValidSubprocessProxy, readConfig } from './config.js'
 import type { HttpProxyConfig, PluginConfig } from './config.js'
 import {
-  DEFAULT_DEEPSEEK_HOST,
-  DEFAULT_MODEL_HOST_SUFFIXES,
-  DEFAULT_MODEL_HOSTS,
   createProxyFetch,
   createRoutingFetch,
-  hostnameOf,
+  isLoopbackHostname,
   normalizeHostEntry,
 } from './proxy.js'
 import type { ProxyFetch } from './proxy.js'
@@ -35,15 +32,13 @@ import { installSystemProxyRpc } from './rpc.js'
 import type { SystemProxyReading } from './rpc-contract.js'
 import { readSystemProxy } from './system-proxy.js'
 
-export { Config, assertValid, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js'
+export { Config, SUBPROCESS_PROXY_SCHEMES, assertValid, isValidSubprocessProxy, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js'
 export type { HttpProxyConfig, PluginConfig } from './config.js'
 export {
-  DEFAULT_DEEPSEEK_HOST,
-  DEFAULT_MODEL_HOST_SUFFIXES,
-  DEFAULT_MODEL_HOSTS,
   createProxyFetch,
   createRoutingFetch,
   hostnameOf,
+  isLoopbackHostname,
   matchesHostEntry,
   normalizeHostEntry,
   shouldProxy,
@@ -112,47 +107,248 @@ export type {
 /** Plugin short name (also the profile entry id that carries its settings). */
 export const name = 'dsh-proxy'
 
-/** The `llm-pi-ai` namespace, read here for its configured gateway hostnames. */
-const PI_AI_NS = 'llm-pi-ai'
+/**
+ * Loopback entries this plugin always adds to a child's `NO_PROXY`.
+ *
+ * Without them, a child that honors the environment would send the harness's
+ * own loopback traffic (Web UI, Connection transport, local test servers)
+ * through the proxy and close a loop — the same reason {@link
+ * isLoopbackHostname} keeps it direct in-process. `::1` and `[::1]` are both
+ * listed because undici reads a bare `::1` as host `:` on port `1` and would
+ * never bypass it.
+ */
+const LOOPBACK_NO_PROXY = ['localhost', '127.0.0.1', '::1', '[::1]'] as const
 
-/** A resolved `llm-pi-ai` section's provider profile subset. */
-interface PiAiSection {
-  providers?: Record<string, { baseURL?: string }>
+/**
+ * The environment names the subprocess export writes, per policy field.
+ *
+ * Both casings are written for every field, exactly as DeepSeek Harness's
+ * own `@deepseek-ai/dsh-http-proxy` does, because the readers disagree on
+ * which one they prefer: undici reads the lowercase spelling first, while a
+ * Windows environment is a single case-insensitive variable, so writing both
+ * spellings costs nothing there and keeps the export correct on POSIX.
+ */
+const SUBPROCESS_ENV_NAMES = {
+  httpProxy: ['http_proxy', 'HTTP_PROXY'],
+  httpsProxy: ['https_proxy', 'HTTPS_PROXY'],
+  noProxy: ['no_proxy', 'NO_PROXY'],
+} as const
+
+/**
+ * The flag that makes a child Node honor the proxy environment.
+ *
+ * Written only beside a URL the child can parse. The flag makes Node build a
+ * proxy dispatcher from the environment at start-up, and a value it cannot
+ * parse — a bare `notaurl`, or a scheme its env-proxy support rejects — stops
+ * the child before it runs. `pnpm`, the program this export exists for, is a
+ * Node program.
+ */
+const NODE_USE_ENV_PROXY = 'NODE_USE_ENV_PROXY'
+
+/**
+ * The `NO_PROXY` value a child receives: loopback, the machine's own entries,
+ * and this plugin's exclusions.
+ *
+ * Exclusions are the highest-priority input, so they belong in the child's
+ * bypass list too: a host that must not go through the proxy here must not go
+ * through it there either. `NO_PROXY` matching is the same umbrella idea one
+ * level up — a name covers itself and its subdomains — so the entries carry
+ * over unchanged, and a name the child's matcher cannot express bypasses
+ * nothing rather than everything.
+ * @param exclude - normalized exclusion entries.
+ * @param pristine - the machine's own environment, or `undefined` before the
+ * first claim captured it (in which case there is nothing of its own to keep).
+ * @returns the comma-separated bypass list.
+ */
+function noProxyValue(
+  exclude: ReadonlySet<string>,
+  pristine: ReadonlyMap<string, string | undefined> | undefined,
+): string {
+  const entries = new Set<string>(LOOPBACK_NO_PROXY)
+  // Keep what the machine already exported: the user's own bypass list is
+  // not this plugin's to discard. Either casing is read, because a POSIX
+  // environment distinguishes them and the machine's own spelling is not
+  // this plugin's to guess.
+  for (const name of SUBPROCESS_ENV_NAMES.noProxy) {
+    const existing = pristine?.get(name)
+    if (existing === undefined) continue
+    for (const entry of existing.split(',')) {
+      const trimmed = entry.trim()
+      if (trimmed.length > 0) entries.add(trimmed)
+    }
+  }
+  for (const entry of exclude) entries.add(entry)
+  return [...entries].join(',')
 }
 
 /**
- * The custom model gateways declared in the `llm-pi-ai` settings section.
+ * Live routing wrappers, oldest first. `globalThis.fetch` is the newest of
+ * them.
  *
- * The section belongs to another plugin, so it is read through the settings
- * service's public `describe()` read rather than injected: this plugin must
- * keep routing with its composition entry even when no settings provider is
- * present, and must not depend on pi-ai's own context.
- * @param ctx - the Cordis context, for the optional settings service.
- * @returns the configured `baseURL`s, malformed ones included (they are
- * pi-ai's to reject, not this plugin's to judge).
+ * Each instance captures the fetch it saw when it mounted, so a teardown that
+ * restored its own capture would hand the global back to a *previous*
+ * instance's wrapper — whose dispatcher that instance had already closed,
+ * leaving every later request to fail with `UND_ERR_DESTROYED`. Keeping the
+ * live wrappers in one stack means a teardown only ever re-points the global
+ * at another live wrapper, or at the fetch that was in place before the first
+ * one.
  */
-function piAiGateways(ctx: Context): string[] {
-  const settings = ctx.get('settings')
-  if (settings === undefined) return []
-  let served
-  try {
-    served = settings.describe().find((row) => String(row.ns) === PI_AI_NS)
-  } catch (cause) {
-    // Reading another plugin's section must never cost this plugin its
-    // routing: an unsettled settings document simply contributes no gateways.
-    ctx.logger.warn(
-      'dsh-proxy: cannot read the %s settings section (%s); using the built-in model hosts only',
-      PI_AI_NS,
-      cause instanceof Error ? cause.message : String(cause),
-    )
-    return []
-  }
-  const section = served?.value as PiAiSection | undefined
-  return Object.values(section?.providers ?? {})
-    .map((profile) => profile.baseURL)
-    .filter((baseURL): baseURL is string => typeof baseURL === 'string' && baseURL.length > 0)
+const liveWrappers: { token: symbol; wrapper: typeof fetch }[] = []
+
+/**
+ * The fetch that requests which stay direct fall through to: the one in place
+ * before any of this module's wrappers, so instances never chain through each
+ * other. Dropped when the last wrapper goes, so a later mount captures
+ * whatever is current then.
+ */
+let baseFetch: typeof fetch | undefined
+
+/** Whether a fetch is one this module installed. */
+function isLiveWrapper(candidate: typeof fetch): boolean {
+  return liveWrappers.some((entry) => entry.wrapper === candidate)
 }
 
+/**
+ * Publish a wrapper as the newest one, remembering the fetch it replaced if it
+ * is the first.
+ * @param token - the installing instance's handle, for {@link uninstallWrapper}.
+ * @param wrapper - the routing fetch to install.
+ */
+function installWrapper(token: symbol, wrapper: typeof fetch): void {
+  liveWrappers.push({ token, wrapper })
+  globalThis.fetch = wrapper
+}
+
+/**
+ * Retire a wrapper, re-pointing the global at the newest one still live — or
+ * back at the fetch that preceded them all when none is.
+ *
+ * The global is only touched while it is still one of ours: another plugin may
+ * have replaced it since, and that replacement is not this module's to undo.
+ * @param token - the handle {@link installWrapper} returned.
+ */
+function uninstallWrapper(token: symbol): void {
+  const index = liveWrappers.findIndex((entry) => entry.token === token)
+  if (index === -1) return
+  const removed = liveWrappers[index]
+  liveWrappers.splice(index, 1)
+  if (removed !== undefined && globalThis.fetch !== removed.wrapper && !isLiveWrapper(globalThis.fetch)) return
+  const newest = liveWrappers[liveWrappers.length - 1]
+  if (newest !== undefined) {
+    globalThis.fetch = newest.wrapper
+    return
+  }
+  const base = baseFetch
+  baseFetch = undefined
+  if (base !== undefined) globalThis.fetch = base
+}
+
+/**
+ * Live claims on the subprocess export, newest last.
+ *
+ * `process.env` is process-wide while a plugin instance is not: the loader
+ * mounts and disposes entries concurrently, so two instances can be alive at
+ * once and either may unload first. A snapshot private to one instance would
+ * then let the one unloading delete what the other had written, and leave the
+ * survivor's address behind for good. So every instance registers a claim
+ * here and the environment is derived from the newest one; withdrawing a claim
+ * re-derives it from whatever is left, and the machine's own values come back
+ * only when the last claim goes.
+ */
+const exportClaims = new Map<symbol, { proxyUrl: string; exclude: ReadonlySet<string> }>()
+
+/**
+ * The machine's own environment, captured once before the first claim wrote,
+ * and dropped when the last claim is withdrawn.
+ *
+ * It is the merge base for `NO_PROXY`, not the live environment: reading the
+ * live one would make a later claim inherit the previous claim's entries,
+ * which then could never be removed.
+ */
+let pristineEnv: Map<string, string | undefined> | undefined
+
+/** Every name the export writes, both casings included. */
+const EXPORT_ENV_NAMES: readonly string[] = [
+  ...SUBPROCESS_ENV_NAMES.httpProxy,
+  ...SUBPROCESS_ENV_NAMES.httpsProxy,
+  ...SUBPROCESS_ENV_NAMES.noProxy,
+  NODE_USE_ENV_PROXY,
+]
+
+/**
+ * Write the environment for the newest claim, or put the machine's own back
+ * when there is none left.
+ */
+function applyExport(): void {
+  let newest: { proxyUrl: string; exclude: ReadonlySet<string> } | undefined
+  for (const claim of exportClaims.values()) newest = claim
+  if (newest === undefined) {
+    const pristine = pristineEnv
+    if (pristine === undefined) return
+    pristineEnv = undefined
+    for (const [name, value] of pristine) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name)
+      else process.env[name] = value
+    }
+    return
+  }
+  const noProxy = noProxyValue(newest.exclude, pristineEnv)
+  for (const name of SUBPROCESS_ENV_NAMES.httpProxy) process.env[name] = newest.proxyUrl
+  for (const name of SUBPROCESS_ENV_NAMES.httpsProxy) process.env[name] = newest.proxyUrl
+  for (const name of SUBPROCESS_ENV_NAMES.noProxy) process.env[name] = noProxy
+  process.env[NODE_USE_ENV_PROXY] = '1'
+}
+
+/**
+ * Export the resolved proxy to child processes through `process.env`.
+ *
+ * This is the only channel that reaches `pnpm` and `git`: they read the
+ * environment, not this plugin's wrapped `fetch`, so plugin installation and
+ * update stay direct without it. The values are written to `process.env`
+ * itself, which is what DSH's own spawn paths copy into a child (see
+ * `scrubbedParentEnv` in `@deepseek-ai/dsh-subprocess`) — including the
+ * `pnpm` spawn of the plugin manager, so an install inherits this routing.
+ *
+ * A URL a child cannot parse is never written, because the flag beside it
+ * would then stop that child at start-up and break plugin installation
+ * outright. Callers check {@link isValidSubprocessProxy} first, and an invalid
+ * URL leaves the environment untouched.
+ * @param proxyUrl - the resolved proxy URL (already known to be valid).
+ * @param exclude - normalized exclusion entries for the child's `NO_PROXY`.
+ * @returns a token identifying this claim, for {@link releaseSubprocessExport}.
+ */
+function claimSubprocessExport(
+  proxyUrl: string,
+  exclude: ReadonlySet<string>,
+): symbol {
+  if (pristineEnv === undefined) {
+    const pristine = new Map<string, string | undefined>()
+    for (const name of EXPORT_ENV_NAMES) pristine.set(name, process.env[name])
+    pristineEnv = pristine
+  }
+  const token = Symbol('dsh-proxy subprocess export')
+  exportClaims.set(token, { proxyUrl, exclude })
+  applyExport()
+  return token
+}
+
+/**
+ * Withdraw one claim on the subprocess export.
+ *
+ * The environment is re-derived from the remaining claims, and only the last
+ * withdrawal puts the machine's own values back — so one instance unloading
+ * can never revoke an export another instance still holds. A name that did not
+ * exist is deleted rather than blanked: an empty `HTTP_PROXY` is not the same
+ * as an absent one, and a child that reads the empty string sees a proxy it
+ * cannot parse.
+ * @param token - the claim to withdraw.
+ * @returns whether the claim was still held.
+ */
+function releaseSubprocessExport(token: symbol): boolean {
+  if (!exportClaims.delete(token)) return false
+  applyExport()
+  return true
+}
 /**
  * The two umbrella sets one routing decision is made of.
  *
@@ -169,11 +365,13 @@ interface ProxyTargets {
 }
 
 /**
- * Collect the hostnames that should travel through the proxy: the official
- * DeepSeek host (or `DEEPSEEK_BASE_URL`), the default endpoints of the
- * built-in pi-ai providers (catalog routes configure no `baseURL` of their
- * own), the configured `proxyHosts`, and the custom model gateways declared
- * in the `llm-pi-ai` settings section.
+ * Collect the hostnames that should travel through the proxy.
+ *
+ * The configured `proxyHosts` is the whole routed set — there is no
+ * auto-detected list behind it, so an empty list routes nothing and the
+ * settings page can promise exactly that. `excludeHosts` comes back beside
+ * it as a separate set because it is judged first and cannot be expressed as
+ * a subtraction from the routed set (see {@link ProxyTargets}).
  *
  * Every entry is an umbrella: `a.b` covers `a.b` and the whole subtree under
  * it (see `matchesHostEntry`), so a domain is named once rather than per
@@ -182,42 +380,20 @@ interface ProxyTargets {
  * @param config - the current plugin configuration.
  * @returns the routed and excluded entry sets.
  */
-function collectProxyHosts(ctx: Context, config: HttpProxyConfig): ProxyTargets {
+function collectProxyHosts(config: HttpProxyConfig): ProxyTargets {
+  // The routed list is exactly what the configuration names. An empty list
+  // routes nothing: there is no auto-detected set behind it, so "no domains"
+  // and "no proxying" are the same statement and the settings page says so.
+  // Entries are normalized so mixed case, `host:port`, pasted URLs, and
+  // `*.domain` / `.domain` spellings all land on the same umbrella.
   const hosts = new Set<string>()
-  if (config.proxyHosts.length > 0) {
-    // Explicit mode: only the listed domains are proxied. Entries are
-    // normalized so mixed case, `host:port`, pasted URLs, and `*.domain` /
-    // `.domain` spellings all land on the same umbrella.
-    for (const host of config.proxyHosts) {
-      const normalized = normalizeHostEntry(host)
-      if (normalized !== undefined) hosts.add(normalized)
-    }
-  } else {
-    // Auto mode: every model-API host DSH knows about.
-    hosts.add(DEFAULT_DEEPSEEK_HOST)
-    // Default endpoints of the installed pi-ai catalog: a catalog route such
-    // as `google-vertex` names no baseURL of its own, so its requests land on
-    // the catalog's endpoint (region-templated for Vertex and Azure, hence
-    // the suffix entries).
-    for (const host of DEFAULT_MODEL_HOSTS) hosts.add(host)
-    for (const suffix of DEFAULT_MODEL_HOST_SUFFIXES) hosts.add(suffix)
-    const deepseekBase = process.env.DEEPSEEK_BASE_URL
-    if (deepseekBase !== undefined && deepseekBase.length > 0) {
-      try {
-        hosts.add(hostnameOf(deepseekBase))
-      } catch {
-        // A malformed base URL is the adapter's to reject, not this plugin's.
-      }
-    }
-    for (const gateway of piAiGateways(ctx)) {
-      try {
-        hosts.add(hostnameOf(gateway))
-      } catch {
-        // Same as above: configuration errors surface where they are written.
-      }
-    }
+  for (const host of config.proxyHosts) {
+    const normalized = normalizeHostEntry(host)
+    if (normalized !== undefined) hosts.add(normalized)
   }
-  // Exclusions always win, in either mode — the same umbrella, judged first.
+  // Exclusions are the highest-priority input there is: an excluded host goes
+  // direct without the routed list being consulted, so it wins even when the
+  // same domain is named in both.
   const exclude = new Set<string>()
   for (const host of config.excludeHosts) {
     const normalized = normalizeHostEntry(host)
@@ -225,7 +401,6 @@ function collectProxyHosts(ctx: Context, config: HttpProxyConfig): ProxyTargets 
   }
   return { hosts, exclude }
 }
-
 /** Whether two hostname sets hold the same hosts (sets are small; order-free compare). */
 function sameHostSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
   if (left.size !== right.size) return false
@@ -255,6 +430,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
   let active: { proxyUrl: string; targets: ProxyTargets; entry: ProxyFetch } | undefined
   let disposed = false
   /**
+   * This instance's live wrapper, when it has one installed. Held as the stack
+   * handle so teardown retires exactly its own entry (see
+   * {@link uninstallWrapper}).
+   */
+  let installed: symbol | undefined
+  /**
+   * This instance's claim on the process-wide subprocess export, when it holds
+   * one. The environment itself is derived at module scope from every live
+   * claim (see {@link exportClaims}); the token is what lets this instance
+   * withdraw its own claim on unload without touching another instance's.
+   */
+  let subprocess: symbol | undefined
+  /**
    * Whether the last refresh saw a configuration that carries nothing: no
    * proxy URL (settings, the system, or `DSH_HTTP_PROXY`), no host entries, and
    * no system-proxy switch.
@@ -262,13 +450,33 @@ export function apply(ctx: Context, config: PluginConfig): void {
   let vacant = true
 
   const deactivate = (): void => {
+    // Retire the wrapper first, so no request can land on the dispatcher this
+    // is about to close. Retiring re-points the global at another live
+    // wrapper when there is one, so unloading the older of two mounted
+    // instances leaves the newer one routing.
+    if (installed !== undefined) {
+      uninstallWrapper(installed)
+      installed = undefined
+    }
     if (active === undefined) return
-    // Restore the platform fetch first, so no request can land on a closing
-    // dispatcher after this point.
-    globalThis.fetch = originalFetch
     const entry = active.entry
     active = undefined
     void entry.close().catch(() => { /* a closed dispatcher is the goal */ })
+  }
+
+  /**
+   * Drop this instance's subprocess export, if it still holds one.
+   *
+   * Called before every new export and on unload, so the environment never
+   * carries two generations of values, and so a plugin that is switched off
+   * stops steering `pnpm` and `git`. Withdrawing by token keeps this safe when
+   * another instance has since taken the export over: in that case this call
+   * does nothing, because the live export is no longer ours to remove.
+   */
+  const dropSubprocess = (): void => {
+    if (subprocess === undefined) return
+    releaseSubprocessExport(subprocess)
+    subprocess = undefined
   }
 
   /**
@@ -396,20 +604,46 @@ export function apply(ctx: Context, config: PluginConfig): void {
       : (cfg.proxy.length > 0 ? cfg.proxy : (process.env.DSH_HTTP_PROXY ?? ''))
     if (system !== undefined) reportSystemProxy(system, proxyUrl)
     // Nothing configured at all — no proxy URL, no routed hosts, no
-    // exclusions, no system-proxy switch — means the profile row carries no
-    // information, so it goes back out (see `scrubProfile`). A row that still
-    // holds settings stays.
+    // exclusions, no system-proxy switch, and not the subprocess switch —
+    // means the profile row carries nothing, so it goes back out (see
+    // `scrubProfile`). A row that still holds settings stays. The switch
+    // counts as information on purpose: `false` is its default, so a stored
+    // `true` is exactly what the row is for, and dropping the row would
+    // forget it.
     vacant = proxyUrl.length === 0 && cfg.proxyHosts.length === 0 && cfg.excludeHosts.length === 0
-      && !cfg.useSystemProxy
+      && !cfg.useSystemProxy && !cfg.proxySubprocesses
     if (proxyUrl.length === 0) {
       deactivate()
+      // No address, no export: a child must not inherit a proxy the plugin
+      // itself is not routing through.
+      dropSubprocess()
       // Nothing to route with: with the settings empty too, the row carries
       // nothing, so it goes — unless DSH's own state says this entry is
       // switched off, in which case the marker has to stay.
       if (vacant) cleanProfileIfOff('cleared settings')
       return
     }
-    const targets = collectProxyHosts(ctx, cfg)
+    const targets = collectProxyHosts(cfg)
+    // The child-process export is reconciled on every refresh, not only when
+    // the in-process wrapper changes: flipping its own switch must take
+    // effect on the next install without a restart. The previous export is
+    // dropped first for two reasons — the environment must never carry two
+    // generations of values, and the merge below reads the machine's own
+    // `NO_PROXY`, which our own write would otherwise shadow and then inherit.
+    dropSubprocess()
+    if (cfg.proxySubprocesses) {
+      if (isValidSubprocessProxy(proxyUrl)) {
+        subprocess = claimSubprocessExport(proxyUrl, targets.exclude)
+      } else {
+        // Deliberately not a failure: an address built for SOCKS serves the
+        // in-process wrapper but cannot be handed to a Node child without
+        // risking its start-up, so the export is skipped and said so.
+        ctx.logger.warn(
+          'dsh-proxy: cannot export the proxy "%s" to child processes (only http/https works); plugin installs stay direct',
+          proxyUrl,
+        )
+      }
+    }
     // No config actually moved: keep the current dispatcher and wrapper, so an
     // unrelated volatile update never tears down in-flight proxy connections.
     if (active !== undefined && active.proxyUrl === proxyUrl && sameTargets(active.targets, targets)) return
@@ -427,12 +661,23 @@ export function apply(ctx: Context, config: PluginConfig): void {
         cause instanceof Error ? cause.message : String(cause),
       )
       deactivate()
+      // Routing is off, so no child may keep inheriting its address either.
+      dropSubprocess()
       return
     }
     const next = { proxyUrl, targets, entry }
     const previous = active
     active = next
-    globalThis.fetch = createRoutingFetch(entry.fetch, originalFetch, targets.hosts, targets.exclude)
+    // The direct path falls through to the fetch that preceded this module's
+    // wrappers, not to whatever instance mounted last: chaining instances
+    // would make one instance's teardown break the other's direct requests.
+    if (baseFetch === undefined) baseFetch = globalThis.fetch
+    const direct = baseFetch ?? originalFetch
+    const wrapper = createRoutingFetch(entry.fetch, direct, targets.hosts, targets.exclude)
+    if (installed !== undefined) uninstallWrapper(installed)
+    const token = Symbol('dsh-proxy wrapper')
+    installWrapper(token, wrapper)
+    installed = token
     // Publish the new wrapper before closing the old dispatcher, so requests
     // started after this point always land on the live dispatcher.
     if (previous !== undefined) {
@@ -448,6 +693,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.effect(() => () => {
     disposed = true
     deactivate()
+    // The environment is part of what this instance installed: leaving it
+    // behind would keep steering `pnpm` and `git` after the plugin is gone.
+    dropSubprocess()
     // An unload is not by itself a switch-off: a restart, an HMR reload, and an
     // update tear the fiber down the same way, and paying for that with the
     // user's settings would be worse than leaving the row. `planRowCleanup`
@@ -458,9 +706,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   // DSH edits this plugin's configuration in place: the Loader commits the new
   // volatile snapshots and announces them, and this instance is expected to
-  // re-read rather than be remounted. The proxied host set also depends on the
-  // `llm-pi-ai` gateways, another volatile section served by the same Loader
-  // path, so one subscription covers both.
+  // re-read rather than be remounted.
   ctx.on('loader/volatile-update', () => {
     refresh()
   })

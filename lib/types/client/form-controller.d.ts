@@ -21,12 +21,14 @@ import type { SystemProxyReading } from '../rpc-contract.js';
 export interface HttpProxySettings {
     /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
     proxy?: string;
-    /** Hostnames to proxy (empty = auto-detect every model host). */
+    /** Hostnames to proxy, with their subdomains (empty = proxy nothing). */
     proxyHosts?: string[];
     /** Hostnames never proxied. */
     excludeHosts?: string[];
     /** Whether the machine's own proxy configuration supplies the address. */
     useSystemProxy?: boolean;
+    /** Whether child processes (plugin install/update) inherit the proxy. */
+    proxySubprocesses?: boolean;
 }
 /** The `llm-pi-ai` section subset this page reads for known model gateways. */
 export interface PiAiSettings {
@@ -37,7 +39,7 @@ export interface PiAiSettings {
 /** The two host-list fields, which share one control shape. */
 export type HostFieldName = 'proxyHosts' | 'excludeHosts';
 /** One editable field of the page. */
-export type FieldName = 'proxy' | HostFieldName | 'useSystemProxy';
+export type FieldName = 'proxy' | HostFieldName | 'useSystemProxy' | 'proxySubprocesses';
 /** What the dsh-proxy settings page renders. */
 export interface HttpProxyFormState extends SettingsFormShell {
     /** Staged proxy URL. */
@@ -48,6 +50,9 @@ export interface HttpProxyFormState extends SettingsFormShell {
     excludeHosts: SettingsFieldState;
     /** Staged "use the system proxy" switch. */
     useSystemProxy: SettingsFieldState;
+    /** Staged "route every request through the proxy" switch. */
+    /** Staged "child processes inherit the proxy" switch. */
+    proxySubprocesses: SettingsFieldState;
     /** Known model hostnames offered beside the host fields (free text still allowed). */
     suggestions: string[];
 }
@@ -108,9 +113,10 @@ export declare class HttpProxyFormController {
     private publish;
     private projection;
     /**
-     * Hostnames offered by the host fields: the default DeepSeek host, the
-     * built-in pi-ai catalog endpoints, every configured gateway, and what is
-     * already saved.
+     * Hostnames offered by the host fields as a convenience: the default
+     * DeepSeek host, the built-in pi-ai catalog endpoints, every configured
+     * gateway, and what is already saved. The list is a pick list only — it does
+     * not decide what is routed.
      */
     private suggestions;
 }

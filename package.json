@@ -47,7 +47,7 @@
     "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && tsdown",
     "prepublishOnly": "pnpm build",
     "typecheck": "tsc --noEmit",
-    "test": "node test/profile-patch-test.mjs && node test/unload-cleanup-test.mjs && node test/host-smoke.mjs && node test/system-proxy-test.mjs && node --import ./test/register-hook.mjs test/client-smoke.mjs"
+    "test": "node test/profile-patch-test.mjs && node test/unload-cleanup-test.mjs && node test/host-smoke.mjs && node test/subprocess-env-test.mjs && node test/wrapper-stack-test.mjs && node test/system-proxy-test.mjs && node --import ./test/register-hook.mjs test/client-smoke.mjs"
   },
   "dsh": {
     "bundle": {

@@ -31,7 +31,8 @@
 /* The system-proxy switch reads as a boxed aside beside the address field it
    fills: the switch itself is the host's own checkbox, the copy underneath
    explains the round trip, and the status line reports the last attempt. */
-.systemProxy {
+.systemProxy,
+.boolean {
   background: var(--dsw-alias-bg-layer-1);
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 8px;

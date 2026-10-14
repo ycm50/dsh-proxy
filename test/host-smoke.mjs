@@ -123,6 +123,35 @@ try { assertValid({ proxy: 'not a url' }) } catch (error) { malformed = error.me
 check('assertValid rejects a malformed URL', typeof malformed, 'string')
 check('assertValid accepts an empty proxy', assertValid({ proxy: '' }), undefined)
 
+// --- 4b. The routing contract, stated as the settings page states it -------
+// The list is the whole policy: listed hosts and their subdomains are routed,
+// nothing else is, and an exclusion outranks the list entirely. These are the
+// rules the page's copy promises, so they are asserted here against the same
+// function the wrapper uses.
+const contract = setOf('proxy.example')
+check('a listed host is routed', shouldProxy('https://proxy.example/x', contract), true)
+check('a subdomain of a listed host is routed', shouldProxy('https://api.proxy.example/x', contract), true)
+check('a deep subdomain is routed', shouldProxy('https://a.b.proxy.example/x', contract), true)
+check('an unlisted host stays direct', shouldProxy('https://other.example/x', contract), false)
+check('a lookalike host stays direct', shouldProxy('https://xproxy.example/x', contract), false)
+
+// An empty list routes nothing: there is no auto-detected set behind it.
+check('an empty list routes nothing', shouldProxy('https://api.deepseek.com/x', new Set()), false)
+check('an empty list routes nothing even for a model host', shouldProxy('https://any.example/x', new Set()), false)
+
+// An exclusion is the highest-priority input there is.
+check('an exclusion outranks the list', shouldProxy('https://proxy.example/x', contract, setOf('proxy.example')), false)
+check('an exclusion outranks the list for a child', shouldProxy('https://api.proxy.example/x', contract, setOf('proxy.example')), false)
+check('an exclusion of one child leaves its sibling routed', shouldProxy('https://api.proxy.example/x', contract, setOf('other.proxy.example')), true)
+
+// Loopback is direct without the list being consulted at all.
+check('loopback stays direct even when listed', shouldProxy('http://127.0.0.1:9/x', setOf('127.0.0.1')), false)
+check('localhost stays direct even when listed', shouldProxy('http://localhost:9/x', setOf('localhost')), false)
+check('loopback is not matched as a suffix', shouldProxy('https://127.0.0.1.evil.example/x', contract), false)
+
+// An unparseable URL has no hostname to judge, so it never travels.
+check('an unparseable URL is never routed', shouldProxy('notaurl', contract), false)
+
 // --- 5. The matching helper is exported for the browser half ---------------
 check('matchesHostEntry is usable directly', matchesHostEntry('api.a.b', 'a.b'), true)
 check('matchesHostEntry rejects a non-child', matchesHostEntry('xay.b', 'a.b'), false)

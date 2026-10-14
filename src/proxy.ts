@@ -3,9 +3,12 @@
  *
  * The plugin does not touch DeepSeek Harness source. It installs a wrapper
  * around `globalThis.fetch` — which both the DeepSeek adapter's raw `fetch` and
- * the pi-ai SDK clients call — and routes only model-API hosts through a
- * proxy dispatcher, leaving every other host (web search, web fetch, MCP, …)
- * on the direct path.
+ * the pi-ai SDK clients call — and routes model-API hosts through a proxy
+ * dispatcher, leaving every other host (web search, web fetch, MCP, …) on the
+ * direct path, and only the hosts the configuration names are routed;
+ * `excludeHosts` always stays direct. Loopback (`127.0.0.0/8`, `localhost`,
+ * `::1`, and the IPv4-mapped spellings) always stays direct as well — see
+ * {@link isLoopbackHostname}.
  * @module dsh-proxy/proxy
  */
 
@@ -28,6 +31,48 @@ export function urlOf(input: string | URL | Request): string {
   return input.url
 }
 
+/** One IPv4 octet, so a loopback match cannot accept `127.999.1.1`. */
+const IPV4_OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)'
+
+/**
+ * The whole `127.0.0.0/8` block, not just its first address: judging only
+ * `127.0.0.1` misses `127.0.0.2`, which binds to loopback just as surely.
+ */
+const LOOPBACK_IPV4 = new RegExp('^127\\.' + IPV4_OCTET + '\\.' + IPV4_OCTET + '\\.' + IPV4_OCTET + '$')
+
+/**
+ * Whether a hostname names this machine, and therefore must stay direct.
+ *
+ * **This guarantee is this plugin's own; the routing this was built on had
+ * none.** The baseline decides purely on `proxyHosts` / `excludeHosts`, which
+ * is harmless while only a handful of model-API domains are routed, but the
+ * harness's own Web UI, its Connection transport, and every local test server
+ * listen on loopback, so a user who writes a loopback endpoint into
+ * `proxyHosts` would send the harness's own traffic back through the proxy
+ * and close a loop on it. Loopback is therefore exempt unconditionally.
+ *
+ * The test is deliberately **pure string comparison — never DNS**. A lookup
+ * here would block, could disagree with what the socket actually resolves,
+ * and would make a routing decision depend on the network being up.
+ *
+ * Callers pass `new URL(...).hostname`, which for IPv6 yields the bracketed
+ * form, so `[::1]` and `[::ffff:127.0.0.1]` are handled alongside the bare
+ * spellings; a trailing dot (the FQDN spelling `localhost.`) is stripped for
+ * the same reason `normalizeHostEntry` strips it.
+ * @param hostname - a URL hostname, bracketed or not, in any case.
+ * @returns whether the host is loopback or an unspecified address.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase()
+  if (host === 'localhost' || host.endsWith('.localhost')) return true
+  if (host === '::1' || host === '::' || host === '0.0.0.0') return true
+  // The IPv4-mapped spelling: `::ffff:127.0.0.1` may arrive fully expanded
+  // as `::ffff:7f00:1`, so read the high group and keep it when 127/8.
+  const mappedHigh = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(host)?.[1]
+  if (mappedHigh !== undefined) return Number.parseInt(mappedHigh, 16) >>> 8 === 127
+  return LOOPBACK_IPV4.test(host.startsWith('::ffff:') ? host.slice(7) : host)
+}
+
 /**
  * Whether a URL's hostname is routed through the proxy.
  *
@@ -35,6 +80,11 @@ export function urlOf(input: string | URL | Request): string {
  * it at any depth (see {@link matchesHostEntry}) — so a single `a.b` reaches
  * `a.b`, `*.a.b`, `*.*.a.b`, and the hyphen-joined region siblings. Malformed
  * URLs are never proxied.
+ *
+ * Loopback is tested first and always stays direct, whatever the entries say;
+ * that bypass is this plugin's own guarantee rather than a configurable one,
+ * so it outranks `proxyHosts` and `excludeHosts` alike. See
+ * {@link isLoopbackHostname}.
  *
  * Exclusions are judged against the same hostname, and they win: they are not
  * a subtraction from the entry set (which could only ever remove an entry
@@ -53,20 +103,20 @@ export function shouldProxy(
 ): boolean {
   try {
     const hostname = new URL(url).hostname
-    let covered = false
-    for (const entry of hosts) {
-      if (matchesHostEntry(hostname, entry)) {
-        covered = true
-        break
-      }
-    }
-    if (!covered) return false
+    // Loopback never travels, whatever the entries say.
+    if (isLoopbackHostname(hostname)) return false
+    // Exclusions are judged first because they are the highest-priority
+    // input: an excluded host is direct without the routed list ever being
+    // consulted, so naming it in both lists can only mean "direct".
     if (exclude !== undefined) {
       for (const entry of exclude) {
         if (matchesHostEntry(hostname, entry)) return false
       }
     }
-    return true
+    for (const entry of hosts) {
+      if (matchesHostEntry(hostname, entry)) return true
+    }
+    return false
   } catch {
     return false
   }
@@ -105,6 +155,10 @@ export function createProxyFetch(proxyUrl: string): ProxyFetch {
 /**
  * Wrap a platform fetch so that requests to `hosts` travel through
  * `proxyFetch` and everything else keeps the original fetch.
+ *
+ * `exclude` is the highest-priority input: an excluded host keeps the
+ * original fetch even when it also matches `hosts`, and loopback never
+ * travels at all (see {@link isLoopbackHostname}).
  * @param proxyFetch - the proxy-bound fetch.
  * @param original - the fetch to keep for non-proxied hosts.
  * @param hosts - umbrella entries routed through the proxy.

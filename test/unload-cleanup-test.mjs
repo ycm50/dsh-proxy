@@ -72,12 +72,14 @@ const settings = {
   proxyHosts: ['commandcode.ai'],
   excludeHosts: [],
   useSystemProxy: false,
+  proxySubprocesses: false,
 }
 const config = (value) => ({
   proxy: { get: () => value.proxy },
   proxyHosts: { get: () => value.proxyHosts },
   excludeHosts: { get: () => value.excludeHosts },
   useSystemProxy: { get: () => value.useSystemProxy },
+  proxySubprocesses: { get: () => value.proxySubprocesses },
 })
 
 /** Load the plugin against one temporary profile and report the file after. */
@@ -119,7 +121,10 @@ rmSync(reloaded, { recursive: true, force: true })
 
 // --- 5. Clearing the settings while running still empties the row ---------
 const cleared = newProfile(`${settingsRow(false)}\n${KEEP}`, ['dsh-proxy'])
-const empty = { proxy: '', proxyHosts: [], excludeHosts: [], useSystemProxy: false }
+const empty = {
+  proxy: '', proxyHosts: [], excludeHosts: [], useSystemProxy: false,
+  proxySubprocesses: false,
+}
 check('cleared settings drop the row while running', run(cleared, empty, false), KEEP)
 rmSync(cleared, { recursive: true, force: true })
 
@@ -127,6 +132,24 @@ rmSync(cleared, { recursive: true, force: true })
 const offEmpty = newProfile(`${markerRow()}\n${KEEP}`, ['dsh-proxy'])
 check('a disabled marker survives an empty unload', run(offEmpty, empty), `${markerRow()}\n${KEEP}`)
 rmSync(offEmpty, { recursive: true, force: true })
+
+// --- 6b. A switch that is its own information keeps the row ----------------
+const subprocessOnly = { ...empty, proxySubprocesses: true }
+const subRow = newProfile(`${settingsRow(false)}\n${KEEP}`, ['dsh-proxy'])
+check('subprocess switch alone keeps the row', run(subRow, subprocessOnly), `${settingsRow(false)}\n${KEEP}`)
+rmSync(subRow, { recursive: true, force: true })
+
+// The inverse: with the switch at its default, the row is still vacant and
+// still goes — the new field must not make every row permanent.
+const bothOff = newProfile(`${settingsRow(false)}\n${KEEP}`, ['dsh-proxy'])
+check('the switch off is still vacant', run(bothOff, empty, false), KEEP)
+rmSync(bothOff, { recursive: true, force: true })
+
+// A switch turned on while the plugin runs must also survive that unload,
+// which is the path a settings save takes.
+const onWhileRunning = newProfile(`${settingsRow(false)}\n${KEEP}`, ['dsh-proxy'])
+check('a switch turned on while running survives the unload', run(onWhileRunning, subprocessOnly), `${settingsRow(false)}\n${KEEP}`)
+rmSync(onWhileRunning, { recursive: true, force: true })
 
 // --- 7. An unreadable profile is never a reason to fail -------------------
 const nowhere = newHost()

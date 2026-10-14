@@ -39,12 +39,14 @@ import { clientRpc } from './connection.js'
 export interface HttpProxySettings {
   /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
   proxy?: string
-  /** Hostnames to proxy (empty = auto-detect every model host). */
+  /** Hostnames to proxy, with their subdomains (empty = proxy nothing). */
   proxyHosts?: string[]
   /** Hostnames never proxied. */
   excludeHosts?: string[]
   /** Whether the machine's own proxy configuration supplies the address. */
   useSystemProxy?: boolean
+  /** Whether child processes (plugin install/update) inherit the proxy. */
+  proxySubprocesses?: boolean
 }
 
 /** The `llm-pi-ai` section subset this page reads for known model gateways. */
@@ -56,7 +58,11 @@ export interface PiAiSettings {
 export type HostFieldName = 'proxyHosts' | 'excludeHosts'
 
 /** One editable field of the page. */
-export type FieldName = 'proxy' | HostFieldName | 'useSystemProxy'
+export type FieldName =
+  | 'proxy'
+  | HostFieldName
+  | 'useSystemProxy'
+  | 'proxySubprocesses'
 
 /**
  * A host-list field: one line of text over a `string[]`.
@@ -140,6 +146,9 @@ export interface HttpProxyFormState extends SettingsFormShell {
   excludeHosts: SettingsFieldState
   /** Staged "use the system proxy" switch. */
   useSystemProxy: SettingsFieldState
+  /** Staged "route every request through the proxy" switch. */
+  /** Staged "child processes inherit the proxy" switch. */
+  proxySubprocesses: SettingsFieldState
   /** Known model hostnames offered beside the host fields (free text still allowed). */
   suggestions: string[]
 }
@@ -183,6 +192,7 @@ export class HttpProxyFormController {
       settingsHostListField('proxyHosts'),
       settingsHostListField('excludeHosts'),
       settingsBooleanField('useSystemProxy'),
+          settingsBooleanField('proxySubprocesses'),
     ])
     // The shared mirror is the one `settings.describe` reader in the browser;
     // reading the `llm-pi-ai` gateways through it keeps this page from opening
@@ -250,14 +260,16 @@ export class HttpProxyFormController {
       proxyHosts: this.form.field('proxyHosts'),
       excludeHosts: this.form.field('excludeHosts'),
       useSystemProxy: this.form.field('useSystemProxy'),
+          proxySubprocesses: this.form.field('proxySubprocesses'),
       suggestions: this.suggestions(),
     }
   }
 
   /**
-   * Hostnames offered by the host fields: the default DeepSeek host, the
-   * built-in pi-ai catalog endpoints, every configured gateway, and what is
-   * already saved.
+   * Hostnames offered by the host fields as a convenience: the default
+   * DeepSeek host, the built-in pi-ai catalog endpoints, every configured
+   * gateway, and what is already saved. The list is a pick list only — it does
+   * not decide what is routed.
    */
   private suggestions(): string[] {
     const hosts = new Set<string>([

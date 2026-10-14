@@ -13,9 +13,9 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { PluginConfig } from './config.js';
-export { Config, assertValid, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js';
+export { Config, SUBPROCESS_PROXY_SCHEMES, assertValid, isValidSubprocessProxy, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js';
 export type { HttpProxyConfig, PluginConfig } from './config.js';
-export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, createProxyFetch, createRoutingFetch, hostnameOf, matchesHostEntry, normalizeHostEntry, shouldProxy, urlOf, } from './proxy.js';
+export { createProxyFetch, createRoutingFetch, hostnameOf, isLoopbackHostname, matchesHostEntry, normalizeHostEntry, shouldProxy, urlOf, } from './proxy.js';
 export type { ProxyFetch } from './proxy.js';
 export { PROXY_ENV_NAMES, WINDOWS_INTERNET_SETTINGS_KEY, normalizeProxyValue, parseGsettingsValue, parseScutilProxy, parseWindowsProxyServer, parseWindowsRegistry, pickWindowsProxy, readEnvironmentProxy, readMacSystemProxy, readSystemProxy, readWindowsSystemProxy, } from './system-proxy.js';
 export type { ScutilReading, WindowsProxyEntry, WindowsProxyRegistry, } from './system-proxy.js';

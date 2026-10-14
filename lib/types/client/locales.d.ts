@@ -15,6 +15,8 @@ export declare const en: {
     proxyHint: string;
     useSystemProxy: string;
     useSystemProxyHint: string;
+    proxySubprocesses: string;
+    proxySubprocessesHint: string;
     systemProxyReading: string;
     systemProxyDetected: string;
     systemProxyNone: string;

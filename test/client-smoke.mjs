@@ -204,7 +204,30 @@ check('page renders both host fields', page.includes('dsh-proxy-hosts') && page.
 check('page renders the stored host list as text', page.includes('gateway.acme.example'))
 check('page offers the known-host pick list', page.includes('«suggestions»'))
 check('page marks the saved proxy overridden', page.includes('«overridden»'))
-check('page renders four inputs', (page.match(/<input/g) ?? []).length === 4, String((page.match(/<input/g) ?? []).length))
+// The page's controls, asserted by identity rather than by a bare total: a
+// hard-coded count goes stale the moment a field is added (it silently passed
+// while the section grew two switches), so name what must be present and let
+// the exact total follow from that.
+//
+// Composition as actually rendered (verified against the built bundle):
+//   text fields (3): dsh-proxy-url, dsh-proxy-hosts, dsh-proxy-exclude
+//   checkboxes  (2): useSystemProxy, proxySubprocesses
+const textInputIds = ['dsh-proxy-url', 'dsh-proxy-hosts', 'dsh-proxy-exclude']
+const checkboxFields = ['useSystemProxy', 'dsh-proxy-subprocesses']
+const inputTags = page.match(/<input\b[^>]*>/g) ?? []
+const isCheckbox = tag => tag.includes('type="checkbox"')
+check('page renders every named text field',
+  textInputIds.every(id => inputTags.some(tag => !isCheckbox(tag) && tag.includes(`id="${id}"`))),
+  inputTags.join(' '))
+check('page renders every named checkbox',
+  checkboxFields.every(field => page.includes(`data-field="${field}"`)),
+  checkboxFields.filter(field => !page.includes(`data-field="${field}"`)).join(', '))
+check('page renders one input per control, and no others',
+  inputTags.length === textInputIds.length + checkboxFields.length
+  && inputTags.filter(isCheckbox).length === checkboxFields.length
+  && inputTags.filter(tag => !isCheckbox(tag)).length === textInputIds.length,
+  `total=${inputTags.length} checkbox=${inputTags.filter(isCheckbox).length} text=${inputTags.filter(tag => !isCheckbox(tag)).length}`)
+check('page renders the subprocess switch copy', page.includes('«proxySubprocesses»'))
 check('page renders the system-proxy switch', page.includes('type="checkbox"') && page.includes('«useSystemProxy»'))
 
 // The switch's reading is a round trip to this plugin's own Host channel: the

@@ -29,13 +29,15 @@ export interface HttpProxyConfig {
      */
     proxy: string;
     /**
-     * Hostnames routed through the proxy. Empty means "auto-detect all model-API
-     * hosts" (`api.deepseek.com`, `DEEPSEEK_BASE_URL`, and every `llm-pi-ai`
-     * gateway `baseURL`); non-empty means route ONLY these hosts, ignoring
-     * auto-detection.
+     * Hostnames routed through the proxy, each an umbrella covering itself and
+     * its subdomains. This is the entire routed set: there is no auto-detected
+     * list behind it, so an empty array routes nothing at all.
      */
     proxyHosts: string[];
-    /** Hostnames that must never be routed, even when auto-detected or listed. */
+    /**
+     * Hostnames that must never be routed. Judged before `proxyHosts`, so an
+     * entry here is direct even when the same host is also listed there.
+     */
     excludeHosts: string[];
     /**
      * Whether to take the proxy address from the operating system instead of the
@@ -44,6 +46,22 @@ export interface HttpProxyConfig {
      * nothing configured.
      */
     useSystemProxy: boolean;
+    /**
+     * Export the proxy to child processes (`pnpm`, `git`, …) through
+     * `process.env`.
+     *
+     * The plugin writes both casings of `HTTP_PROXY` / `HTTPS_PROXY` and
+     * `NO_PROXY` — the readers disagree on which one they prefer — and stores
+     * what it replaced so unloading restores the original values. A proxy URL a
+     * Node child cannot parse (`socks5:`, or anything `new URL` rejects) is
+     * never injected; see {@link isValidSubprocessProxy}.
+     *
+     * It is independent of the host lists: it carries the same resolved address
+     * to the programs that cannot see the in-process routing, and an
+     * `excludeHosts` entry cannot carve out a child process, so the address a
+     * child inherits is the one routing itself uses.
+     */
+    proxySubprocesses: boolean;
 }
 /** Runtime schema for the plugin entry; also the settings page's form. */
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
@@ -51,11 +69,13 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     useSystemProxy: z<boolean, boolean, "volatile-defined">;
+    proxySubprocesses: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     proxy: z<string, string, "volatile-defined">;
     proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     useSystemProxy: z<boolean, boolean, "volatile-defined">;
+    proxySubprocesses: z<boolean, boolean, "volatile-defined">;
 }>>, "plain">;
 /**
  * Parsed configuration as the Loader hands it to `apply`.
@@ -70,6 +90,36 @@ export type PluginConfig = ReturnType<typeof Config>;
  * @returns the current configuration snapshot.
  */
 export declare function readConfig(config: PluginConfig): HttpProxyConfig;
+/**
+ * Proxy URL schemes that can be handed to a child process through the
+ * environment.
+ *
+ * Deliberately narrower than {@link SUPPORTED_PROXY_SCHEMES}: this is not
+ * about what `undici` can serve, but about what the child process will
+ * accept. `NODE_USE_ENV_PROXY` reads `HTTPS_PROXY` / `HTTP_PROXY` and
+ * understands only `http:` and `https:`; a `socks5:` value there is either
+ * silently ignored or fatal, so it must never be written.
+ */
+export declare const SUBPROCESS_PROXY_SCHEMES: readonly string[];
+/**
+ * Whether a proxy URL may be exported to child processes as
+ * `HTTPS_PROXY` / `HTTP_PROXY`.
+ *
+ * A malformed value is not merely useless — with `NODE_USE_ENV_PROXY=1` set,
+ * a Node child process (and `pnpm` is one) exits immediately on a value it
+ * cannot parse, so a bad environment variable breaks plugin installation
+ * outright. This is why the check is "could this be parsed by `new URL` and
+ * is its scheme one of `http`/`https`" and not a pattern match: the child
+ * parses it the same way.
+ *
+ * `undefined` and `''` are invalid on purpose. "No proxy" is not a value to
+ * inject; it is the absence of one, and the caller distinguishes the two
+ * (nothing is written, and any previous value is restored) rather than writing
+ * an empty string that would shadow the machine's real proxy.
+ * @param value - the resolved proxy URL, or undefined/empty when unset.
+ * @returns whether the value is safe to put in `HTTPS_PROXY`/`HTTP_PROXY`.
+ */
+export declare function isValidSubprocessProxy(value: string | undefined): boolean;
 /**
  * Reject a proxy URL this plugin cannot serve. Called before a dispatcher is
  * built, so a bad URL degrades to "routing off" with a log line instead of

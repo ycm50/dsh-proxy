@@ -147,6 +147,39 @@ function sourceLabel(t: HttpProxyTranslate, source: SystemProxySource): string {
 }
 
 /**
+ * One staged on/off control: the host's own checkbox plus the copy that
+ * explains it.
+ *
+ * A checkbox has no third state, so ticking it stages an explicit `"true"` or
+ * `"false"` text, which the form model's boolean spec writes as the boolean the
+ * Host schema declares — the same gesture as every other control on the page,
+ * saved only when the user saves.
+ */
+function BooleanControl(props: {
+  t: HttpProxyTranslate
+  id: string
+  label: string
+  hint: string
+  state: SettingsFieldState
+  disabled: boolean
+  onToggle: (checked: boolean) => void
+  status: string | undefined
+}): ReactElement {
+  return (
+    <div className={css.boolean} data-field={props.id}>
+      <Checkbox
+        checked={props.state.text === 'true'}
+        disabled={props.disabled}
+        label={props.label}
+        onChange={props.onToggle}
+      />
+      <p className={css.hint}>{props.hint}</p>
+      {props.status !== undefined ? <p className={css.status} role="status">{props.status}</p> : null}
+    </div>
+  )
+}
+
+/**
  * The "use the system proxy" switch and the line reporting what reading it
  * produced.
  *
@@ -164,16 +197,16 @@ function SystemProxyControl(props: {
   onToggle: (checked: boolean) => void
 }): ReactElement {
   return (
-    <div className={css.systemProxy}>
-      <Checkbox
-        checked={props.state.text === 'true'}
-        disabled={props.disabled}
-        label={props.t('useSystemProxy')}
-        onChange={props.onToggle}
-      />
-      <p className={css.hint}>{props.t('useSystemProxyHint')}</p>
-      {props.status !== undefined ? <p className={css.status} role="status">{props.status}</p> : null}
-    </div>
+    <BooleanControl
+      t={props.t}
+      id="useSystemProxy"
+      label={props.t('useSystemProxy')}
+      hint={props.t('useSystemProxyHint')}
+      state={props.state}
+      disabled={props.disabled}
+      status={props.status}
+      onToggle={props.onToggle}
+    />
   )
 }
 
@@ -223,6 +256,31 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
     props.edit('proxy', reading.proxy)
     setStatus(`${t('systemProxyDetected')}: ${reading.proxy} · ${sourceLabel(t, reading.source)}`)
   }
+  /**
+   * One staged on/off switch of this page.
+   *
+   * The label and the hint share the field's name, so the two dictionary keys
+   * a switch needs are its name and its name with `Hint` — the same pairing
+   * every other control on the page uses.
+   * @param field - the field's name for its staged edit.
+   * @param id - the wrapper's `data-field` and the control's identity.
+   * @returns the switch.
+   */
+  const booleanControl = (
+    field: 'proxySubprocesses',
+    id: string,
+  ): ReactElement => (
+    <BooleanControl
+      t={t}
+      id={id}
+      label={t(field)}
+      hint={t(`${field}Hint`)}
+      state={state[field]}
+      disabled={disabled}
+      status={undefined}
+      onToggle={checked => { props.edit(field, checked ? 'true' : 'false') }}
+    />
+  )
   const hostField = (field: HostFieldName, id: string, label: string, hint: string): ReactElement => (
     <HostField
       t={t}
@@ -267,6 +325,7 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
           status={status}
           onToggle={checked => { void toggleSystemProxy(checked) }}
         />
+        {booleanControl('proxySubprocesses', 'dsh-proxy-subprocesses')}
         {hostField('proxyHosts', 'dsh-proxy-hosts', t('hosts'), t('hostsHint'))}
         {hostField('excludeHosts', 'dsh-proxy-exclude', t('exclude'), t('excludeHint'))}
       </SettingsForm>

@@ -668,13 +668,23 @@ export function apply(ctx: Context, config: PluginConfig): void {
     const next = { proxyUrl, targets, entry }
     const previous = active
     active = next
+    // Retire this instance's previous wrapper *before* looking at the global:
+    // while we still hold it, it is the top of the stack, so capturing first
+    // would record our own wrapper as the fetch this module replaced — and
+    // that wrapper's dispatcher is about to close, pinning a dead link to the
+    // bottom of the stack that the last teardown would then restore.
+    if (installed !== undefined) {
+      uninstallWrapper(installed)
+      installed = undefined
+    }
     // The direct path falls through to the fetch that preceded this module's
     // wrappers, not to whatever instance mounted last: chaining instances
     // would make one instance's teardown break the other's direct requests.
-    if (baseFetch === undefined) baseFetch = globalThis.fetch
+    // Only the first wrapper captures it — an empty stack is exactly what
+    // makes `globalThis.fetch` that fetch.
+    if (baseFetch === undefined && liveWrappers.length === 0) baseFetch = globalThis.fetch
     const direct = baseFetch ?? originalFetch
     const wrapper = createRoutingFetch(entry.fetch, direct, targets.hosts, targets.exclude)
-    if (installed !== undefined) uninstallWrapper(installed)
     const token = Symbol('dsh-proxy wrapper')
     installWrapper(token, wrapper)
     installed = token

@@ -26,17 +26,26 @@ function check(label, actual, expected = true) {
   if (!ok) console.log('      expected', JSON.stringify(expected), 'got', JSON.stringify(actual))
 }
 
-/** A host context real enough for `apply`: effects collected, no services. */
+/**
+ * A host context real enough for `apply`: effects collected, subscriptions
+ * recorded so a settings change can be replayed.
+ */
 function newHost() {
   const teardowns = []
+  const subscribers = []
   const ctx = {
     effect(fn) { const disposer = fn(); if (typeof disposer === 'function') teardowns.push(disposer); return disposer },
     logger: { info() {}, warn() {}, error() {}, debug() {} },
-    on() { return () => {} },
+    on(_event, callback) { subscribers.push(callback); return () => {} },
     get() { return undefined },
     inject(_deps, callback) { callback(ctx); return () => {} },
   }
-  return { ctx, unload: () => { for (const disposer of teardowns.splice(0)) disposer() } }
+  return {
+    ctx,
+    /** Announce a settings edit, the way the Loader does. */
+    fire: () => { for (const callback of [...subscribers]) callback() },
+    unload: () => { for (const disposer of teardowns.splice(0)) disposer() },
+  }
 }
 
 /** The settings row's live fields. */
@@ -99,7 +108,22 @@ try {
   first.unload()
   check('and the platform fetch comes back after it', globalThis.fetch === platformFetch)
 
-  // --- 6. A wrapper that never replaced ours is not ours to undo ------------
+  // --- 6. A settings edit reinstalls the wrapper ---------------------------
+  // Reinstalling retires the old wrapper before publishing the new one. Doing
+  // it the other way round would capture our *own* wrapper as the fetch this
+  // module replaced, and the last teardown would then restore that dead link
+  // instead of the platform fetch.
+  process.env.DSH_PROFILE_DIR = profileA
+  const edited = { ...base }
+  apply(first.ctx, config(edited))
+  const beforeEdit = globalThis.fetch
+  edited.proxy = 'http://127.0.0.1:10810'
+  first.fire()
+  check('a settings edit reinstalls the wrapper', globalThis.fetch !== beforeEdit)
+  first.unload()
+  check('unloading after an edit restores the platform fetch', globalThis.fetch === platformFetch)
+
+  // --- 7. A wrapper that never replaced ours is not ours to undo ------------
   process.env.DSH_PROFILE_DIR = profileA
   apply(first.ctx, config({ ...base }))
   const thirdParty = (() => platformFetch)

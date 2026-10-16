@@ -210,10 +210,18 @@ check('page marks the saved proxy overridden', page.includes('«overridden»'))
 // the exact total follow from that.
 //
 // Composition as actually rendered (verified against the built bundle):
-//   text fields (3): dsh-proxy-url, dsh-proxy-hosts, dsh-proxy-exclude
-//   checkboxes  (2): useSystemProxy, proxySubprocesses
-const textInputIds = ['dsh-proxy-url', 'dsh-proxy-hosts', 'dsh-proxy-exclude']
-const checkboxFields = ['useSystemProxy', 'dsh-proxy-subprocesses']
+//   text fields (8): dsh-proxy-url, dsh-proxy-hosts, dsh-proxy-exclude, and the
+//                    five stability numbers
+//   checkboxes  (3): useSystemProxy, proxySubprocesses, retryOnPossibleDelivery
+const stabilityNumberIds = [
+  'dsh-proxy-connect-timeout',
+  'dsh-proxy-response-timeout',
+  'dsh-proxy-stream-idle',
+  'dsh-proxy-retry-count',
+  'dsh-proxy-retry-delay',
+]
+const textInputIds = ['dsh-proxy-url', 'dsh-proxy-hosts', 'dsh-proxy-exclude', ...stabilityNumberIds]
+const checkboxFields = ['useSystemProxy', 'dsh-proxy-subprocesses', 'dsh-proxy-retry-possible']
 const inputTags = page.match(/<input\b[^>]*>/g) ?? []
 const isCheckbox = tag => tag.includes('type="checkbox"')
 check('page renders every named text field',
@@ -229,6 +237,21 @@ check('page renders one input per control, and no others',
   `total=${inputTags.length} checkbox=${inputTags.filter(isCheckbox).length} text=${inputTags.filter(tag => !isCheckbox(tag)).length}`)
 check('page renders the subprocess switch copy', page.includes('«proxySubprocesses»'))
 check('page renders the system-proxy switch', page.includes('type="checkbox"') && page.includes('«useSystemProxy»'))
+// The stability group: every number carries both a label and its hint, and the
+// hints are where the "not below 30000" guidance lives.
+check('page renders the stability heading and its hint',
+  page.includes('«stability»') && page.includes('«stabilityHint»'),
+  page.slice(page.indexOf('dsh-proxy-stability-heading'), page.indexOf('dsh-proxy-stability-heading') + 120))
+check('page renders every stability control with its hint',
+  ['connectTimeoutMs', 'responseTimeoutMs', 'streamIdleTimeoutMs', 'retryCount', 'retryDelayMs', 'retryOnPossibleDelivery']
+    .every((field) => page.includes('«' + field + '»') && page.includes('«' + field + 'Hint»')),
+  '')
+// The hint TEXT is not on the rendered page (the harness stubs `t` with a key
+// placeholder), so the floor is asserted on the registered dictionary itself.
+check('the connect-timeout hint states the 30000 floor',
+  String(registeredDictionaries?.dicts?.en?.connectTimeoutMsHint ?? '').includes('30000')
+  && String(registeredDictionaries?.dicts?.zh?.connectTimeoutMsHint ?? '').includes('30000'),
+  String(registeredDictionaries?.dicts?.en?.connectTimeoutMsHint ?? '(no dictionary)'))
 
 // The switch's reading is a round trip to this plugin's own Host channel: the
 // page asks for it, and fills the address field from the answer.

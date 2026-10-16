@@ -11,6 +11,7 @@
  * @module dsh-proxy/config
  */
 import z from '@deepseek-ai/schemastery';
+import type { StabilityConfig, StabilityWarn } from './stability.js';
 /** Proxy URL schemes `undici`'s `ProxyAgent` accepts. */
 export declare const SUPPORTED_PROXY_SCHEMES: readonly string[];
 /**
@@ -62,6 +63,15 @@ export interface HttpProxyConfig {
      * child inherits is the one routing itself uses.
      */
     proxySubprocesses: boolean;
+    /**
+     * Effective stability settings after clamping (see `dsh-proxy/stability`).
+     *
+     * Kept nested rather than flattened here so the request path receives one
+     * coherent snapshot: the agent options and the retry policy are built from
+     * exactly this object, and a channel rebuilt from a half-applied edit would
+     * mix two generations of timeouts.
+     */
+    stability: StabilityConfig;
 }
 /** Runtime schema for the plugin entry; also the settings page's form. */
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
@@ -70,12 +80,24 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     useSystemProxy: z<boolean, boolean, "volatile-defined">;
     proxySubprocesses: z<boolean, boolean, "volatile-defined">;
+    connectTimeoutMs: z<number, number, "volatile-defined">;
+    responseTimeoutMs: z<number, number, "volatile-defined">;
+    streamIdleTimeoutMs: z<number, number, "volatile-defined">;
+    retryCount: z<number, number, "volatile-defined">;
+    retryDelayMs: z<number, number, "volatile-defined">;
+    retryOnPossibleDelivery: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     proxy: z<string, string, "volatile-defined">;
     proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     useSystemProxy: z<boolean, boolean, "volatile-defined">;
     proxySubprocesses: z<boolean, boolean, "volatile-defined">;
+    connectTimeoutMs: z<number, number, "volatile-defined">;
+    responseTimeoutMs: z<number, number, "volatile-defined">;
+    streamIdleTimeoutMs: z<number, number, "volatile-defined">;
+    retryCount: z<number, number, "volatile-defined">;
+    retryDelayMs: z<number, number, "volatile-defined">;
+    retryOnPossibleDelivery: z<boolean, boolean, "volatile-defined">;
 }>>, "plain">;
 /**
  * Parsed configuration as the Loader hands it to `apply`.
@@ -89,7 +111,7 @@ export type PluginConfig = ReturnType<typeof Config>;
  * @param config - the parsed plugin config the Loader supplied.
  * @returns the current configuration snapshot.
  */
-export declare function readConfig(config: PluginConfig): HttpProxyConfig;
+export declare function readConfig(config: PluginConfig, warn?: StabilityWarn): HttpProxyConfig;
 /**
  * Proxy URL schemes that can be handed to a child process through the
  * environment.

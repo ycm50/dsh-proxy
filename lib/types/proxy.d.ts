@@ -4,14 +4,23 @@
  * The plugin does not touch DeepSeek Harness source. It installs a wrapper
  * around `globalThis.fetch` — which both the DeepSeek adapter's raw `fetch` and
  * the pi-ai SDK clients call — and routes model-API hosts through a proxy
- * dispatcher, leaving every other host (web search, web fetch, MCP, …) on the
- * direct path, and only the hosts the configuration names are routed;
- * `excludeHosts` always stays direct. Loopback (`127.0.0.0/8`, `localhost`,
- * `::1`, and the IPv4-mapped spellings) always stays direct as well — see
- * {@link isLoopbackHostname}.
+ * dispatcher, leaving every other host on this plugin's own **hardened direct**
+ * channel. Only the hosts the configuration names are routed; `excludeHosts`
+ * always stays direct, and loopback and private networks are exempt on top of
+ * that (see {@link isExemptHostname}).
+ *
+ * Both channels are built from the same hardened options (see
+ * `dsh-proxy/stability`): a long connect ceiling, TCP keepalive, a bounded
+ * pooled-idle window, and a transport-level retry for connection failures. The
+ * point of hardening the direct channel too is that "not proxied" must not mean
+ * "back to undici's 10 second connect timeout" — the failing requests measured
+ * on this machine were direct connects.
  * @module dsh-proxy/proxy
  */
-export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, hostnameOf, matchesHostEntry, normalizeHostEntry, } from './hosts.js';
+import { Dispatcher } from 'undici';
+import type { StabilityConfig } from './stability.js';
+import type { RetryAttempt } from './retry.js';
+export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, hostnameOf, isLanHostname, matchesHostEntry, normalizeHostEntry, } from './hosts.js';
 /** Extract the absolute URL string from a `fetch` input. */
 export declare function urlOf(input: string | URL | Request): string;
 /**
@@ -38,6 +47,20 @@ export declare function urlOf(input: string | URL | Request): string;
  */
 export declare function isLoopbackHostname(hostname: string): boolean;
 /**
+ * Whether a hostname must never travel through a proxy at all.
+ *
+ * Two builds of the same rule, and both are this plugin's own guarantee rather
+ * than a configurable one: loopback carries the harness's own surfaces (a
+ * proxied Web UI request would loop back onto the proxy), and private networks
+ * carry local model servers, MCP endpoints, and routers (a proxied LAN request
+ * either fails or leaves the building). Listing such a host in
+ * `proxyHosts` therefore cannot route it; `excludeHosts` is judged later
+ * and only ever agrees.
+ * @param hostname - a URL hostname, bracketed or not, in any case.
+ * @returns whether the host is exempt from proxying.
+ */
+export declare function isExemptHostname(hostname: string): boolean;
+/**
  * Whether a URL's hostname is routed through the proxy.
  *
  * An entry is an umbrella — it covers its own domain and every host built on
@@ -45,10 +68,10 @@ export declare function isLoopbackHostname(hostname: string): boolean;
  * `a.b`, `*.a.b`, `*.*.a.b`, and the hyphen-joined region siblings. Malformed
  * URLs are never proxied.
  *
- * Loopback is tested first and always stays direct, whatever the entries say;
- * that bypass is this plugin's own guarantee rather than a configurable one,
- * so it outranks `proxyHosts` and `excludeHosts` alike. See
- * {@link isLoopbackHostname}.
+ * Exemptions are tested first and always stay direct, whatever the entries say:
+ * loopback and private networks (see {@link isExemptHostname}). Loopback is
+ * this plugin's own guarantee rather than a configurable one, so it outranks
+ * `proxyHosts` and `excludeHosts` alike.
  *
  * Exclusions are judged against the same hostname, and they win: they are not
  * a subtraction from the entry set (which could only ever remove an entry
@@ -61,6 +84,18 @@ export declare function isLoopbackHostname(hostname: string): boolean;
  * @returns whether the request should travel through the proxy.
  */
 export declare function shouldProxy(url: string, hosts: ReadonlySet<string>, exclude?: ReadonlySet<string>): boolean;
+/**
+ * The same decision, taken from a hostname the caller already has.
+ *
+ * The dispatcher layer reasons about a request's origin and never builds a URL
+ * for it, so this is the one place the rule lives and {@link shouldProxy} is
+ * the URL-shaped entry to it.
+ * @param hostname - the request hostname.
+ * @param hosts - normalized entries routed through the proxy.
+ * @param exclude - normalized entries that must never be routed.
+ * @returns whether the request should travel through the proxy.
+ */
+export declare function shouldProxyHostname(hostname: string, hosts: ReadonlySet<string>, exclude?: ReadonlySet<string>): boolean;
 /** A proxy dispatcher plus a `fetch` bound to it, for teardown. */
 export interface ProxyFetch {
     /** Fetch that routes every request through the proxy. */
@@ -68,25 +103,62 @@ export interface ProxyFetch {
     /** Close the proxy dispatcher's idle connections. */
     close(): Promise<void>;
 }
+/** One hardened channel: its fetch, its dispatcher, and how to retire it. */
+export interface HardenedChannel extends ProxyFetch {
+    /** The dispatcher itself, so it can be re-exported to callers that need one. */
+    dispatcher: Dispatcher;
+    /** Whether this channel actually travels through a proxy. */
+    proxied: boolean;
+}
+/** Build parameters shared by both channels. */
+export interface ChannelOptions {
+    /** Effective stability settings (timeouts, keepalive, retry budget). */
+    stability: StabilityConfig;
+    /** Called once per transport retry, for the host half's log line. */
+    onRetry?: (attempt: RetryAttempt) => void;
+}
 /**
- * Create a fetch bound to a proxy dispatcher. `undici`'s `ProxyAgent` accepts
- * `http:`, `https:`, `socks4:`, `socks4a:`, `socks5:`, and `socks5h:` proxy URLs.
+ * Build one hardened channel.
+ *
+ * Without a proxy URL this is the direct channel — the one every unlisted host
+ * uses, so it carries the same long connect ceiling, TCP keepalive, bounded
+ * idle window, and transport retry as the proxied one. With a URL it is a
+ * `ProxyAgent`, and its `connect.timeout` is what bounds the CONNECT tunnel
+ * (the measured 10.5 s handshake that a 10 s default used to turn into
+ * UND_ERR_CONNECT_TIMEOUT).
+ * @param proxyUrl - the proxy endpoint, or undefined/empty for a direct channel.
+ * @param options - stability settings and the retry reporter.
+ * @returns the channel, ready to install.
+ */
+export declare function createHardenedChannel(proxyUrl: string | undefined, options: ChannelOptions): HardenedChannel;
+/**
+ * Create a fetch bound to a proxy dispatcher, hardened by the shipped defaults.
+ *
+ * Kept as the narrow, single-purpose entry point; the host half builds its
+ * channels through {@link createHardenedChannel} so it can pass live settings.
  * @param proxyUrl - the proxy endpoint.
  * @returns the proxy-bound fetch and its dispatcher closer.
  */
 export declare function createProxyFetch(proxyUrl: string): ProxyFetch;
 /**
- * Wrap a platform fetch so that requests to `hosts` travel through
- * `proxyFetch` and everything else keeps the original fetch.
+ * Wrap a channel so that requests to `hosts` travel through `proxyFetch` and
+ * everything else keeps the caller's direct channel.
  *
- * `exclude` is the highest-priority input: an excluded host keeps the
- * original fetch even when it also matches `hosts`, and loopback never
- * travels at all (see {@link isLoopbackHostname}).
+ * The direct argument is deliberately the plugin's **hardened direct** fetch
+ * rather than the platform fetch: a host that is not named in the configuration
+ * still gets the longer connect ceiling, the keepalive, and the transport retry.
+ * Falling back to the platform fetch would put every unlisted host back on
+ * undici's 10 second connect timeout, which is the failure this plugin exists
+ * to remove.
+ *
+ * `exclude` is the highest-priority input: an excluded host keeps the direct
+ * fetch even when it also matches `hosts`, and an exempt host (loopback or a
+ * private address) never travels at all (see {@link isExemptHostname}).
  * @param proxyFetch - the proxy-bound fetch.
- * @param original - the fetch to keep for non-proxied hosts.
+ * @param directFetch - this plugin's hardened direct fetch.
  * @param hosts - umbrella entries routed through the proxy.
  * @param exclude - umbrella entries that must never be routed.
  * @returns the routing fetch.
  */
-export declare function createRoutingFetch(proxyFetch: typeof fetch, original: typeof fetch, hosts: ReadonlySet<string>, exclude?: ReadonlySet<string>): typeof fetch;
+export declare function createRoutingFetch(proxyFetch: typeof fetch, directFetch: typeof fetch, hosts: ReadonlySet<string>, exclude?: ReadonlySet<string>): typeof fetch;
 //# sourceMappingURL=proxy.d.ts.map

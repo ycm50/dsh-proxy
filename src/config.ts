@@ -13,6 +13,9 @@
 
 import z from '@deepseek-ai/schemastery'
 
+import { DEFAULT_STABILITY, readStability } from './stability.js'
+import type { StabilityConfig, StabilityWarn } from './stability.js'
+
 /** Proxy URL schemes `undici`'s `ProxyAgent` accepts. */
 export const SUPPORTED_PROXY_SCHEMES: readonly string[] = [
   'http',
@@ -72,6 +75,15 @@ export interface HttpProxyConfig {
    * child inherits is the one routing itself uses.
    */
   proxySubprocesses: boolean
+  /**
+   * Effective stability settings after clamping (see `dsh-proxy/stability`).
+   *
+   * Kept nested rather than flattened here so the request path receives one
+   * coherent snapshot: the agent options and the retry policy are built from
+   * exactly this object, and a channel rebuilt from a half-applied edit would
+   * mix two generations of timeouts.
+   */
+  stability: StabilityConfig
 }
 
 /** Runtime schema for the plugin entry; also the settings page's form. */
@@ -81,6 +93,17 @@ export const Config = z.object({
   excludeHosts: z.array(z.string()).default([]).volatile(),
   useSystemProxy: z.boolean().default(false).volatile(),
   proxySubprocesses: z.boolean().default(false).volatile(),
+  // Stability knobs. They are volatile for the same reason the fields above
+  // are: the settings page edits the live reference, the plugin rebuilds its
+  // channels, and no restart is involved. The bounds live in
+  // `dsh-proxy/stability` and are applied on read, so a hand-edited
+  // profile that names an absurd value degrades instead of breaking the mount.
+  connectTimeoutMs: z.natural().default(DEFAULT_STABILITY.connectTimeoutMs).volatile(),
+  responseTimeoutMs: z.natural().default(DEFAULT_STABILITY.responseTimeoutMs).volatile(),
+  streamIdleTimeoutMs: z.natural().default(DEFAULT_STABILITY.streamIdleTimeoutMs).volatile(),
+  retryCount: z.natural().default(DEFAULT_STABILITY.retryCount).volatile(),
+  retryDelayMs: z.natural().default(DEFAULT_STABILITY.retryDelayMs).volatile(),
+  retryOnPossibleDelivery: z.boolean().default(DEFAULT_STABILITY.retryOnPossibleDelivery).volatile(),
 })
 
 /**
@@ -101,15 +124,41 @@ function hostList(value: unknown): string[] {
  * @param config - the parsed plugin config the Loader supplied.
  * @returns the current configuration snapshot.
  */
-export function readConfig(config: PluginConfig): HttpProxyConfig {
-  const proxy = config.proxy.get()
+export function readConfig(config: PluginConfig, warn?: StabilityWarn): HttpProxyConfig {
+  const proxy = readRef(config.proxy)
   return {
     proxy: typeof proxy === 'string' ? proxy : '',
-    proxyHosts: hostList(config.proxyHosts.get()),
-    excludeHosts: hostList(config.excludeHosts.get()),
-    useSystemProxy: config.useSystemProxy.get() === true,
-    proxySubprocesses: config.proxySubprocesses.get() === true,
+    proxyHosts: hostList(readRef(config.proxyHosts)),
+    excludeHosts: hostList(readRef(config.excludeHosts)),
+    useSystemProxy: readRef(config.useSystemProxy) === true,
+    proxySubprocesses: readRef(config.proxySubprocesses) === true,
+    stability: readStability({
+      connectTimeoutMs: readRef(config.connectTimeoutMs),
+      responseTimeoutMs: readRef(config.responseTimeoutMs),
+      streamIdleTimeoutMs: readRef(config.streamIdleTimeoutMs),
+      retryCount: readRef(config.retryCount),
+      retryDelayMs: readRef(config.retryDelayMs),
+      retryOnPossibleDelivery: readRef(config.retryOnPossibleDelivery),
+    }, warn),
   }
+}
+
+/**
+ * Read one volatile reference without trusting its shape.
+ *
+ * The Loader always hands over the schema's references, but this plugin can be
+ * mounted from a context that predates a field — an older profile, a test, or
+ * another package composing it. Reading an absent field as "absent" gives the
+ * caller the shipped default, where a bare `.get()` call would throw from
+ * inside the request path.
+ * @param ref - the stored reference, a plain value, or nothing.
+ * @returns the current value, or undefined when there is nothing to read.
+ */
+function readRef(ref: unknown): unknown {
+  if (ref === undefined || ref === null) return undefined
+  const candidate = ref as { get?: () => unknown }
+  if (typeof candidate.get === 'function') return candidate.get()
+  return ref
 }
 
 /**

@@ -162,3 +162,66 @@ export function splitHostEntries(text: string): string[] {
   return text.split(/[,\s]+/).filter(part => part.length > 0)
 }
 
+/**
+ * One IPv4 octet, so a private-range match cannot accept \`10.999.1.1\`.
+ */
+const OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)'
+
+/**
+ * The private, link-local, carrier-grade-NAT, and unspecified IPv4 blocks.
+ *
+ * These are the "physical space" this plugin must never route: a LAN service
+ * (a local model server, an MCP endpoint on another machine, a router admin
+ * page) reached through a forward proxy either fails outright or — worse —
+ * travels out to a provider and back. The same reasoning that keeps loopback
+ * direct keeps these direct, so the exemption is built in and cannot be
+ * overridden by a host list.
+ */
+const PRIVATE_IPV4 = [
+  new RegExp('^10\\.' + OCTET + '\\.' + OCTET + '\\.' + OCTET + '$'),
+  new RegExp('^192\\.168\\.' + OCTET + '\\.' + OCTET + '$'),
+  new RegExp('^172\\.(?:1[6-9]|2\\d|3[01])\\.' + OCTET + '\\.' + OCTET + '$'),
+  new RegExp('^169\\.254\\.' + OCTET + '\\.' + OCTET + '$'),
+  new RegExp('^100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.' + OCTET + '\\.' + OCTET + '$'),
+  new RegExp('^0\\.' + OCTET + '\\.' + OCTET + '\\.' + OCTET + '$'),
+]
+
+/** Single-label and reserved suffixes that name a local network, never a public endpoint. */
+const LOCAL_SUFFIXES: readonly string[] = [
+  '.local',
+  '.localdomain',
+  '.lan',
+  '.internal',
+  '.home.arpa',
+  '.localhost',
+]
+
+/**
+ * Whether a hostname names a private/local network rather than the public
+ * internet. Pure string comparison, never DNS — the decision must not depend
+ * on the network being reachable (see \`isLoopbackHostname\` for the same rule).
+ *
+ * Covered: \`10/8\`, \`172.16/12\`, \`192.168/16\`, \`169.254/16\`, \`100.64/10\`,
+ * \`0/8\`; IPv6 unique-local \`fc00::/7\` and link-local \`fe80::/10\` (including the
+ * IPv4-mapped spellings Node's \`URL\` may hand over); and the local suffixes
+ * above.
+ * @param hostname - a URL hostname, bracketed or not, in any case.
+ * @returns whether the host is a private/local address.
+ */
+export function isLanHostname(hostname: string): boolean {
+  let host = hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase()
+  if (host.length === 0) return false
+  // An IPv4-mapped IPv6 spelling carries the real address after this prefix.
+  if (host.startsWith('::ffff:')) host = host.slice(7)
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+  if (/^f[cd][0-9a-f]{2}:/.test(host)) return true
+  if (/^fe[89ab][0-9a-f]:/.test(host)) return true
+  for (const suffix of LOCAL_SUFFIXES) {
+    if (host.endsWith(suffix)) return true
+  }
+  if (host.indexOf('.') === -1 && host.indexOf(':') === -1) return true // a single label is a LAN name
+  for (const pattern of PRIVATE_IPV4) {
+    if (pattern.test(host)) return true
+  }
+  return false
+}

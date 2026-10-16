@@ -21,12 +21,21 @@ import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { assertValid, Config, isValidSubprocessProxy, readConfig } from './config.js'
 import type { HttpProxyConfig, PluginConfig } from './config.js'
 import {
-  createProxyFetch,
+  createHardenedChannel,
   createRoutingFetch,
   isLoopbackHostname,
   normalizeHostEntry,
+  shouldProxyHostname,
 } from './proxy.js'
-import type { ProxyFetch } from './proxy.js'
+import type { HardenedChannel } from './proxy.js'
+import {
+  RoutingDispatcher,
+  installGlobalDispatcher,
+  uninstallGlobalDispatcher,
+} from './dispatch.js'
+import { describeStability, stabilityIsDefault } from './stability.js'
+import type { StabilityConfig } from './stability.js'
+import type { RetryAttempt } from './retry.js'
 import { planRowCleanup, pruneProxyEntryFromProfile, stripProxyEntryConfigFromProfile } from './profile-patch.js'
 import { installSystemProxyRpc } from './rpc.js'
 import type { SystemProxyReading } from './rpc-contract.js'
@@ -35,16 +44,47 @@ import { readSystemProxy } from './system-proxy.js'
 export { Config, SUBPROCESS_PROXY_SCHEMES, assertValid, isValidSubprocessProxy, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js'
 export type { HttpProxyConfig, PluginConfig } from './config.js'
 export {
+  createHardenedChannel,
   createProxyFetch,
   createRoutingFetch,
   hostnameOf,
+  isLanHostname,
   isLoopbackHostname,
   matchesHostEntry,
   normalizeHostEntry,
   shouldProxy,
+  shouldProxyHostname,
   urlOf,
 } from './proxy.js'
-export type { ProxyFetch } from './proxy.js'
+export type { ChannelOptions, HardenedChannel, ProxyFetch } from './proxy.js'
+export {
+  RoutingDispatcher,
+  installGlobalDispatcher,
+  isExemptHostname,
+  liveDispatcherCount,
+  uninstallGlobalDispatcher,
+} from './dispatch.js'
+export type { RoutingInput } from './dispatch.js'
+export {
+  DEFAULT_STABILITY,
+  POOLED_IDLE_WINDOW_MS,
+  STABILITY_BOUNDS,
+  STABILITY_FIELDS,
+  TCP_KEEPALIVE_DELAY_MS,
+  agentOptionsOf,
+  describeStability,
+  readStability,
+  stabilityIsDefault,
+} from './stability.js'
+export type { HardenedAgentOptions, StabilityConfig, StabilityField } from './stability.js'
+export {
+  isAborted,
+  isReplayableRequest,
+  isRetryableTransportError,
+  transportCodeOf,
+  withTransportRetry,
+} from './retry.js'
+export type { RetryAttempt, RetryPolicy } from './retry.js'
 export {
   PROXY_ENV_NAMES,
   WINDOWS_INTERNET_SETTINGS_KEY,
@@ -416,18 +456,85 @@ function sameTargets(left: ProxyTargets, right: ProxyTargets): boolean {
 }
 
 /**
- * Install the routing wrapper, and the Connection channel that lets the
- * settings page read this machine's proxy. The configuration is re-read per
- * refresh, so a settings change reaches the next request without a restart; an
- * empty `proxy` deactivates routing and restores the platform fetch, and
+ * Whether two stability snapshots would build the same channels.
+ *
+ * A connection pool carries the timeouts it was built with, so a change to any
+ * of them has to rebuild. Together with the proxy address and the host lists
+ * this decides whether a volatile update touches the request path at all: an
+ * unrelated edit must not re-dial every idle connection.
+ * @param left - the settings the live generation was built from.
+ * @param right - the settings the current configuration resolves to.
+ * @returns whether the live channels may be kept.
+ */
+function sameStability(left: StabilityConfig, right: StabilityConfig): boolean {
+  return left.connectTimeoutMs === right.connectTimeoutMs
+    && left.responseTimeoutMs === right.responseTimeoutMs
+    && left.streamIdleTimeoutMs === right.streamIdleTimeoutMs
+    && left.retryCount === right.retryCount
+    && left.retryDelayMs === right.retryDelayMs
+    && left.retryOnPossibleDelivery === right.retryOnPossibleDelivery
+}
+
+/**
+ * Build this instance's transport-retry reporter.
+ *
+ * A retry is worth a warning — it means a connection was dropped and re-dialled
+ * — but a gateway that is shedding connections would otherwise fill the log, so
+ * the report is throttled per transport code: one repeated code is noise, a new
+ * code is news.
+ * @param ctx - the Cordis context, for the logger.
+ * @returns the reporter handed to both channels.
+ */
+function makeRetryReporter(ctx: Context): (attempt: RetryAttempt) => void {
+  const lastSeen = new Map<string, number>()
+  const windowMs = 60_000
+  return (attempt) => {
+    const now = Date.now()
+    if (now - (lastSeen.get(attempt.code) ?? 0) < windowMs) return
+    lastSeen.set(attempt.code, now)
+    ctx.logger.warn(
+      'dsh-proxy: transport retry %d/%d after %s (%s)',
+      attempt.attempt,
+      attempt.maxRetries,
+      attempt.code,
+      attempt.url,
+    )
+  }
+}
+
+/**
+ * Install the two interception layers — the process-wide dispatcher and the
+ * routing `fetch` — plus the Connection channel that lets the settings page
+ * read this machine's proxy.
+ *
+ * Why both layers: the dispatcher covers callers that captured `fetch` or use
+ * undici directly, and the wrapper covers callers that pass their own
+ * dispatcher; between them, every in-process request takes this plugin's
+ * decision, and every one travels on a hardened channel. The configuration is
+ * re-read per refresh, so a settings change reaches the next request without a
+ * restart; an empty `proxy` deactivates routing and restores both globals, and
  * `useSystemProxy` exchanges the typed address for the machine's own.
  * @param ctx - the Cordis context this plugin mounts into.
  * @param config - the parsed plugin config; its fields are live references.
  */
 export function apply(ctx: Context, config: PluginConfig): void {
-  const originalFetch = globalThis.fetch
-  /** The active routing wrapper plus the settings it was built from. */
-  let active: { proxyUrl: string; targets: ProxyTargets; entry: ProxyFetch } | undefined
+  /**
+   * The active generation: the settings it was built from and the routing
+   * dispatcher holding both channels.
+   *
+   * `stability` is part of the identity on purpose. A connection pool carries
+   * the timeouts it was built with, so a timeout edit must rebuild; an
+   * unrelated volatile update must not, because a rebuild re-dials every idle
+   * connection.
+   */
+  let active: {
+    proxyUrl: string
+    targets: ProxyTargets
+    stability: StabilityConfig
+    routing: RoutingDispatcher
+  } | undefined
+  /** This instance's live global-dispatcher install, when it holds one. */
+  let dispatcherInstalled: symbol | undefined
   let disposed = false
   /**
    * This instance's live wrapper, when it has one installed. Held as the stack
@@ -450,18 +557,25 @@ export function apply(ctx: Context, config: PluginConfig): void {
   let vacant = true
 
   const deactivate = (): void => {
-    // Retire the wrapper first, so no request can land on the dispatcher this
-    // is about to close. Retiring re-points the global at another live
-    // wrapper when there is one, so unloading the older of two mounted
+    // Retire both global references first, so no request can land on the
+    // channels this is about to close. Each slot re-points at another live
+    // instance when there is one, so unloading the older of two mounted
     // instances leaves the newer one routing.
     if (installed !== undefined) {
       uninstallWrapper(installed)
       installed = undefined
     }
+    if (dispatcherInstalled !== undefined) {
+      uninstallGlobalDispatcher(dispatcherInstalled)
+      dispatcherInstalled = undefined
+    }
     if (active === undefined) return
-    const entry = active.entry
+    const entry = active
     active = undefined
-    void entry.close().catch(() => { /* a closed dispatcher is the goal */ })
+    // Close, never destroy: an in-flight streaming response finishes instead of
+    // being cut off by an unload, and a caller that captured the dispatcher
+    // keeps working until it lets go.
+    void entry.routing.close().catch(() => { /* a closed dispatcher is the goal */ })
   }
 
   /**
@@ -590,7 +704,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   const refresh = (): void => {
     if (disposed) return
-    const cfg = readConfig(config)
+    const cfg = readConfig(config, (message) => ctx.logger.warn(message))
+    const stability = cfg.stability
     // With "use the system proxy" on, the machine's own configuration is the
     // address: it is read here, so ticking the switch (or replacing the system
     // proxy and reloading the plugin) reaches the next request without a
@@ -612,6 +727,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
     // forget it.
     vacant = proxyUrl.length === 0 && cfg.proxyHosts.length === 0 && cfg.excludeHosts.length === 0
       && !cfg.useSystemProxy && !cfg.proxySubprocesses
+      // A stability value away from its default is information this row
+      // carries: it must survive while it is set, and the cleanup rules above
+      // must not treat the row as empty.
+      && stabilityIsDefault(stability)
     if (proxyUrl.length === 0) {
       deactivate()
       // No address, no export: a child must not inherit a proxy the plugin
@@ -644,16 +763,34 @@ export function apply(ctx: Context, config: PluginConfig): void {
         )
       }
     }
-    // No config actually moved: keep the current dispatcher and wrapper, so an
-    // unrelated volatile update never tears down in-flight proxy connections.
-    if (active !== undefined && active.proxyUrl === proxyUrl && sameTargets(active.targets, targets)) return
-    let entry: ProxyFetch
+    // No config actually moved: keep the current channels and wrapper, so an
+    // unrelated volatile update never tears down in-flight connections.
+    if (
+      active !== undefined
+      && active.proxyUrl === proxyUrl
+      && sameTargets(active.targets, targets)
+      && sameStability(active.stability, stability)
+    ) return
+    let direct: HardenedChannel
+    let proxied: HardenedChannel
+    let routing: RoutingDispatcher
     try {
       // `assertValid` guards the interactive path, but the `DSH_HTTP_PROXY`
       // fallback bypasses it — judge the resolved URL here too, so a bad value
       // degrades to "routing off" instead of failing the plugin mount.
       assertValid({ proxy: proxyUrl })
-      entry = createProxyFetch(proxyUrl)
+      const onRetry = makeRetryReporter(ctx)
+      // Both channels are this plugin's own: a host the configuration does not
+      // name still gets the long connect ceiling, the keepalive, and the
+      // transport retry, rather than falling back to undici's 10 second
+      // connect timeout — the failure this plugin exists to remove.
+      direct = createHardenedChannel(undefined, { stability, onRetry })
+      proxied = createHardenedChannel(proxyUrl, { stability, onRetry })
+      routing = new RoutingDispatcher({
+        direct: direct.dispatcher,
+        proxied: proxied.dispatcher,
+        proxyFor: (hostname) => shouldProxyHostname(hostname, targets.hosts, targets.exclude),
+      })
     } catch (cause) {
       ctx.logger.warn(
         'dsh-proxy: invalid proxy URL "%s" (%s); routing stays off',
@@ -665,7 +802,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       dropSubprocess()
       return
     }
-    const next = { proxyUrl, targets, entry }
+    const next = { proxyUrl, targets, stability, routing }
     const previous = active
     active = next
     // Retire this instance's previous wrapper *before* looking at the global:
@@ -683,15 +820,26 @@ export function apply(ctx: Context, config: PluginConfig): void {
     // Only the first wrapper captures it — an empty stack is exactly what
     // makes `globalThis.fetch` that fetch.
     if (baseFetch === undefined && liveWrappers.length === 0) baseFetch = globalThis.fetch
-    const direct = baseFetch ?? originalFetch
-    const wrapper = createRoutingFetch(entry.fetch, direct, targets.hosts, targets.exclude)
+    // Install the dispatcher first: a library that captured `fetch` before this
+    // plugin mounted reaches the network through the global dispatcher, so it
+    // must see the new generation from its first request.
+    const dispatcherToken = Symbol('dsh-proxy dispatcher')
+    installGlobalDispatcher(dispatcherToken, routing)
+    dispatcherInstalled = dispatcherToken
+    const wrapper = createRoutingFetch(proxied.fetch, direct.fetch, targets.hosts, targets.exclude)
     const token = Symbol('dsh-proxy wrapper')
     installWrapper(token, wrapper)
     installed = token
+    ctx.logger.info(
+      'dsh-proxy: routing installed — proxied hosts %d, exclusions %d, %s',
+      targets.hosts.size,
+      targets.exclude.size,
+      describeStability(stability),
+    )
     // Publish the new wrapper before closing the old dispatcher, so requests
     // started after this point always land on the live dispatcher.
     if (previous !== undefined) {
-      void previous.entry.close().catch(() => { /* replaced by a newer wrapper */ })
+      void previous.routing.close().catch(() => { /* replaced by a newer generation */ })
     }
   }
 

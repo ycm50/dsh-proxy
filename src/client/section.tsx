@@ -17,7 +17,7 @@ import { Button, Checkbox, SettingsForm, SettingsValueField } from '@deepseek-ai
 import type { SettingsFieldState, SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SystemProxySource } from '../rpc-contract.js'
 import type { HttpProxySectionProps, HttpProxyTranslate } from './contract.js'
-import type { HostFieldName } from './form-controller.js'
+import type { BooleanFieldName, HostFieldName, NumberFieldName } from './form-controller.js'
 import { matchesHostEntry, normalizeHostEntry, splitHostEntries } from '../hosts.js'
 import css from './section.module.css'
 
@@ -267,7 +267,7 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
    * @returns the switch.
    */
   const booleanControl = (
-    field: 'proxySubprocesses',
+    field: BooleanFieldName,
     id: string,
   ): ReactElement => (
     <BooleanControl
@@ -279,6 +279,27 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
       disabled={disabled}
       status={undefined}
       onToggle={checked => { props.edit(field, checked ? 'true' : 'false') }}
+    />
+  )
+  /**
+   * One staged numeric field of the stability group.
+   *
+   * `numeric` only hints a numeric keypad; what a value may be stays the Host
+   * schema's business, and its verdict appears as the field's invalid state.
+   */
+  const numberControl = (field: NumberFieldName, id: string): ReactElement => (
+    <SettingsValueField
+      id={id}
+      label={t(field)}
+      hint={t(`${field}Hint`)}
+      numeric
+      overriddenLabel={t('overridden')}
+      resetLabel={t('reset')}
+      invalidLabel={t('invalid')}
+      disabled={disabled}
+      {...state[field]}
+      onEdit={text => { props.edit(field, text) }}
+      onReset={() => { props.resetField(field) }}
     />
   )
   const hostField = (field: HostFieldName, id: string, label: string, hint: string): ReactElement => (
@@ -328,6 +349,14 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
         {booleanControl('proxySubprocesses', 'dsh-proxy-subprocesses')}
         {hostField('proxyHosts', 'dsh-proxy-hosts', t('hosts'), t('hostsHint'))}
         {hostField('excludeHosts', 'dsh-proxy-exclude', t('exclude'), t('excludeHint'))}
+        <h3 className={css.heading} id="dsh-proxy-stability-heading">{t('stability')}</h3>
+        <p className={css.intro}>{t('stabilityHint')}</p>
+        {numberControl('connectTimeoutMs', 'dsh-proxy-connect-timeout')}
+        {numberControl('responseTimeoutMs', 'dsh-proxy-response-timeout')}
+        {numberControl('streamIdleTimeoutMs', 'dsh-proxy-stream-idle')}
+        {numberControl('retryCount', 'dsh-proxy-retry-count')}
+        {numberControl('retryDelayMs', 'dsh-proxy-retry-delay')}
+        {booleanControl('retryOnPossibleDelivery', 'dsh-proxy-retry-possible')}
       </SettingsForm>
     </section>
   )

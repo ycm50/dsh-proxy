@@ -161,6 +161,10 @@ pnpm build       # 生成 lib/，需一并提交
 pnpm pack        # 生成 dsh-proxy-<version>.tgz，可用 file: 路径直接装
 ```
 
+测试清单见 [TESTING.md](TESTING.md)：说「全局测试」时按那份列表逐项跑，说「更新测试列表」时才改它；日常只改了什么就只跑对应那几项。
+
+版本库约定（对应 `.gitignore`）：`lib/**` —— 包括 `lib/index.js`、`lib/profile-patch.js`、`lib/client.js`、`lib/client.js.map` 与 `lib/types/**` —— **故意提交**，这样从 GitHub 或 tarball 安装都不需要构建步骤；`node_modules/`、`dist/`、`build/`、`out/`、`coverage/`、`*.tsbuildinfo`、`*.tgz`、`*.log`、`*.prune.tmp`、`.env*`、编辑器目录（`.vscode/`、`.idea/`）与 `.pnpm-store/` 都在忽略之列。**改了源码必须 `pnpm build` 并把 `lib/**` 一起提交**，否则装进 DSH 的还是旧代码（本次 0.5.0 就是源码与 `lib/` 同一次提交）。
+
 `pnpm build` 是双 entry：`lib/index.js`（host 半）与 `lib/profile-patch.js`（自清理，单独成文件是为了能脱离 undici / schemastery 单独测试）。`lib/client.js` 与 `lib/types/**` 也要一起提交。
 
 host 半的模块划分：`index.ts`（生命周期与两层装卸）、`dispatch.ts`（进程级 dispatcher：按 hostname 分流、豁免判定、多实例安装栈）、`proxy.ts`（两条通道的构建与路由包裹层）、`stability.ts`（超时/重试参数、范围钳制、undici 选项）、`retry.ts`（连接级重试与可重放判定）、`config.ts`（volatile 配置与防御式读取）、`hosts.ts`（域名整树匹配与回环/内网豁免）、`system-proxy.ts` 与 `profile-patch.ts` 各司其职。

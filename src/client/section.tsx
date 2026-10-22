@@ -326,6 +326,8 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
         onSave={props.save}
         onDiscard={props.discard}
       >
+        <h3 className={css.heading} id="dsh-proxy-connection-heading">{t('connection')}</h3>
+        <p className={css.intro}>{t('connectionHint')}</p>
         <SettingsValueField
           id="dsh-proxy-url"
           label={t('proxy')}
@@ -347,8 +349,10 @@ export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
           onToggle={checked => { void toggleSystemProxy(checked) }}
         />
         {booleanControl('proxySubprocesses', 'dsh-proxy-subprocesses')}
-        {hostField('proxyHosts', 'dsh-proxy-hosts', t('hosts'), t('hostsHint'))}
-        {hostField('excludeHosts', 'dsh-proxy-exclude', t('exclude'), t('excludeHint'))}
+        {booleanControl('debugLog', 'dsh-proxy-debug-log')}
+        <h3 className={css.heading} id="dsh-proxy-domains-heading">{t('domains')}</h3>
+        <p className={css.intro}>{t('domainsHint')}</p>
+        {hostField('forceHosts', 'dsh-proxy-force', t('force'), t('forceHint'))}
         <h3 className={css.heading} id="dsh-proxy-stability-heading">{t('stability')}</h3>
         <p className={css.intro}>{t('stabilityHint')}</p>
         {numberControl('connectTimeoutMs', 'dsh-proxy-connect-timeout')}

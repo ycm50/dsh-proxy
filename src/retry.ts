@@ -133,8 +133,17 @@ export function isAborted(signal: AbortSignal | null | undefined): boolean {
   return signal !== null && signal !== undefined && signal.aborted === true
 }
 
-/** Sleep that a caller's abort can cut short, so Stop stays immediate. */
-function abortableSleep(ms: number, signal: AbortSignal | null | undefined): Promise<void> {
+/**
+ * Sleep that a caller's abort can cut short, so Stop stays immediate.
+ *
+ * Exported because the routing layer runs the retry loop itself (it has to: each
+ * attempt takes a different channel), and that loop needs the same interruptible
+ * wait the single-channel retry uses.
+ * @param ms - how long to wait.
+ * @param signal - the caller's abort signal, if any.
+ * @returns a promise that settles when the wait ends or the caller aborts.
+ */
+export function abortableSleep(ms: number, signal: AbortSignal | null | undefined): Promise<void> {
   return new Promise<void>((resolve) => {
     if (signal?.aborted === true || ms <= 0) {
       resolve()
@@ -148,6 +157,18 @@ function abortableSleep(ms: number, signal: AbortSignal | null | undefined): Pro
     const timer = setTimeout(finish, ms)
     signal?.addEventListener('abort', finish, { once: true })
   })
+}
+
+/**
+ * The backoff before one retry: the base doubled per attempt, jittered by up to
+ * a quarter either way so a fleet of clients does not retry in lockstep.
+ * @param baseDelayMs - the configured first delay.
+ * @param attempt - 1 for the first retry.
+ * @returns the delay in whole milliseconds.
+ */
+export function retryDelayMs(baseDelayMs: number, attempt: number): number {
+  const base = Number.isFinite(baseDelayMs) ? Math.max(0, baseDelayMs) : 0
+  return Math.round(base * 2 ** (Math.max(1, attempt) - 1) * (0.75 + Math.random() * 0.5))
 }
 
 /**
@@ -182,8 +203,7 @@ export function withTransportRetry(fetchImpl: typeof fetch, policy: RetryPolicy)
         if (!worthRetrying) throw error
         attempt += 1
         policy.onRetry?.({ attempt, maxRetries, code, url: urlOfInput(input) })
-        const delay = Math.round(baseDelayMs * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5))
-        await abortableSleep(delay, signal)
+        await abortableSleep(retryDelayMs(baseDelayMs, attempt), signal)
         // The caller may have aborted during the sleep: surface the abort, not a stale retry.
         if (isAborted(signal)) throw error
       }

@@ -57,8 +57,6 @@ function newHost() {
 /** The settings row's live fields, with the two switches stated per case. */
 const config = (value) => ({
   proxy: { get: () => value.proxy },
-  proxyHosts: { get: () => value.proxyHosts },
-  excludeHosts: { get: () => value.excludeHosts },
   useSystemProxy: { get: () => value.useSystemProxy },
   proxySubprocesses: { get: () => value.proxySubprocesses },
   // Stability refs, present for the same reason the Loader always supplies
@@ -80,7 +78,7 @@ function newProfile() {
 }
 
 const base = {
-  proxy: 'http://127.0.0.1:10808', proxyHosts: [], excludeHosts: [], useSystemProxy: false, proxySubprocesses: false,
+  proxy: 'http://127.0.0.1:10808', forceHosts: [], useSystemProxy: false, proxySubprocesses: false,
 }
 
 const pristine = snapshot()
@@ -108,13 +106,16 @@ onHost.unload()
 check('unloading the only export puts the environment back', JSON.stringify(snapshot()), JSON.stringify(pristine))
 rmSync(onDir, { recursive: true, force: true })
 
-// --- 3. Exclusions join that bypass list -----------------------------------
+// --- 3. The force list is deliberately not a bypass list -------------------
+// The only list left is "always use the proxy", so a pinned host must travel
+// through the proxy in the child too: putting it in NO_PROXY would be the exact
+// opposite of what the user asked for.
 process.env.DSH_PROFILE_DIR = onDir
 // A volatile update is the settings save path: the running instance re-reads.
-const config2 = config({ ...base, proxySubprocesses: true, excludeHosts: ['internal.example'] })
+const config2 = config({ ...base, proxySubprocesses: true, forceHosts: ['mirror.example'] })
 const reloaded = newHost()
 apply(reloaded.ctx, config2)
-check('an exclusion reaches the child bypass list', snapshot().NO_PROXY.includes('internal.example'))
+check('a pinned host is not bypassed for the child', !snapshot().NO_PROXY.includes('mirror.example'))
 reloaded.unload()
 
 // --- 4. Unload gives the environment back exactly --------------------------

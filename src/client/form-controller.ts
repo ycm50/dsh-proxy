@@ -39,14 +39,14 @@ import { clientRpc } from './connection.js'
 export interface HttpProxySettings {
   /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
   proxy?: string
-  /** Hostnames to proxy, with their subdomains (empty = proxy nothing). */
-  proxyHosts?: string[]
-  /** Hostnames never proxied. */
-  excludeHosts?: string[]
+  /** Hostnames pinned to the proxy: always proxied, never alternated. */
+  forceHosts?: string[]
   /** Whether the machine's own proxy configuration supplies the address. */
   useSystemProxy?: boolean
   /** Whether child processes (plugin install/update) inherit the proxy. */
   proxySubprocesses?: boolean
+  /** Whether the attempt record is appended to a file. */
+  debugLog?: boolean
   /** Ceiling for a TCP connect and for a proxy CONNECT tunnel, in milliseconds. */
   connectTimeoutMs?: number
   /** Ceiling for waiting on response headers; 0 disables the watchdog. */
@@ -66,11 +66,11 @@ export interface PiAiSettings {
   providers?: Record<string, { baseURL?: string }>
 }
 
-/** The two host-list fields, which share one control shape. */
-export type HostFieldName = 'proxyHosts' | 'excludeHosts'
+/** The host-list field, which has the one control shape. */
+export type HostFieldName = 'forceHosts'
 
-/** The staged on/off switches of the stability group, and the subprocess one. */
-export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'retryOnPossibleDelivery'
+/** The staged on/off switches: the subprocess one and the retry-safety one. */
+export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'debugLog' | 'retryOnPossibleDelivery'
 
 /**
  * The numeric fields of the stability group.
@@ -195,28 +195,27 @@ function asReading(value: unknown): SystemProxyReading | undefined {
 export interface HttpProxyFormState extends SettingsFormShell {
   /** Staged proxy URL. */
   proxy: SettingsFieldState
-  /** Staged proxy-only hosts, comma/whitespace separated. */
-  proxyHosts: SettingsFieldState
-  /** Staged excluded hosts, comma/whitespace separated. */
-  excludeHosts: SettingsFieldState
+  /** Staged always-proxied hosts, comma/whitespace separated. */
+  forceHosts: SettingsFieldState
   /** Staged "use the system proxy" switch. */
   useSystemProxy: SettingsFieldState
-  /** Staged "route every request through the proxy" switch. */
   /** Staged "child processes inherit the proxy" switch. */
   proxySubprocesses: SettingsFieldState
+  /** Staged "append the attempt record to a file" switch. */
+  debugLog: SettingsFieldState
   /** Staged connect ceiling, in milliseconds. */
   connectTimeoutMs: SettingsFieldState
   /** Staged response-header ceiling, in milliseconds. */
   responseTimeoutMs: SettingsFieldState
   /** Staged streaming idle ceiling, in milliseconds. */
   streamIdleTimeoutMs: SettingsFieldState
-  /** Staged connection retry budget. */
+  /** Staged connection retry budget (attempts after the first). */
   retryCount: SettingsFieldState
   /** Staged first backoff delay, in milliseconds. */
   retryDelayMs: SettingsFieldState
   /** Staged "retry a possibly-delivered failure too" switch. */
   retryOnPossibleDelivery: SettingsFieldState
-  /** Known model hostnames offered beside the host fields (free text still allowed). */
+  /** Known model hostnames offered beside the host field (free text still allowed). */
   suggestions: string[]
 }
 
@@ -256,10 +255,10 @@ export class HttpProxyFormController {
   ) {
     this.form = new SettingsFormModel<HttpProxySettings>(scope, [
       settingsTextField('proxy'),
-      settingsHostListField('proxyHosts'),
-      settingsHostListField('excludeHosts'),
+      settingsHostListField('forceHosts'),
       settingsBooleanField('useSystemProxy'),
       settingsBooleanField('proxySubprocesses'),
+      settingsBooleanField('debugLog'),
       settingsNumberField('connectTimeoutMs'),
       settingsNumberField('responseTimeoutMs'),
       settingsNumberField('streamIdleTimeoutMs'),
@@ -330,10 +329,10 @@ export class HttpProxyFormController {
     return {
       ...this.form.shell(),
       proxy: this.form.field('proxy'),
-      proxyHosts: this.form.field('proxyHosts'),
-      excludeHosts: this.form.field('excludeHosts'),
+      forceHosts: this.form.field('forceHosts'),
       useSystemProxy: this.form.field('useSystemProxy'),
       proxySubprocesses: this.form.field('proxySubprocesses'),
+      debugLog: this.form.field('debugLog'),
       connectTimeoutMs: this.form.field('connectTimeoutMs'),
       responseTimeoutMs: this.form.field('responseTimeoutMs'),
       streamIdleTimeoutMs: this.form.field('streamIdleTimeoutMs'),
@@ -345,7 +344,7 @@ export class HttpProxyFormController {
   }
 
   /**
-   * Hostnames offered by the host fields as a convenience: the default
+   * Hostnames offered by the host field as a convenience: the default
    * DeepSeek host, the built-in pi-ai catalog endpoints, every configured
    * gateway, and what is already saved. The list is a pick list only — it does
    * not decide what is routed.
@@ -357,7 +356,7 @@ export class HttpProxyFormController {
       ...DEFAULT_MODEL_HOST_SUFFIXES,
     ])
     const saved = this.scope.getSnapshot().value ?? {}
-    for (const list of [saved.proxyHosts, saved.excludeHosts]) {
+    for (const list of [saved.forceHosts]) {
       if (!Array.isArray(list)) continue
       for (const host of list) {
         if (typeof host !== 'string') continue

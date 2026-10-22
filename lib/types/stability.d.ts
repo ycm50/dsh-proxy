@@ -84,15 +84,42 @@ export interface HardenedAgentOptions {
     connect: HardenedConnectOptions;
 }
 /**
- * The pooled-idle window this plugin allows, in milliseconds.
+ * How long a pooled connection may sit idle before undici retires it.
  *
- * Deliberately far below undici's 600 s default: a socket that has sat idle for
- * minutes is exactly the one a carrier NAT, a proxy, or the peer itself has
- * already dropped, and reusing it is how "Connection error." and "terminated"
- * appear on a request that a fresh connection would have served. 60 s of idle
- * costs one extra handshake after a long pause and removes that class.
+ * Measured on this machine (a local HTTP proxy in front of a model gateway):
+ * a fresh tunnel costs 1.3-1.6 s, almost all of it a second TLS handshake
+ * inside the proxy `CONNECT`, and a conversation's cadence is one user turn
+ * every 10-60 s. undici's own default is 4 s and this plugin used to ship
+ * 60 s, so in practice **every message paid for a new tunnel** — which is
+ * exactly the first-token latency this constant now removes: 120 s keeps a
+ * conversation on one tunnel, so the handshake no longer sits inside the
+ * first token.
+ *
+ * The trade-off is a socket that has sat idle long enough for a carrier NAT,
+ * the proxy, or the peer to have dropped it. That is not left to luck: undici
+ * discards a pooled socket it sees close while idle, and the transport retry
+ * layer in `dsh-proxy/retry` re-dials anything that slips through.
  */
-export declare const POOLED_IDLE_WINDOW_MS = 60000;
+export declare const POOLED_IDLE_WINDOW_MS = 120000;
+/**
+ * The ceiling the negotiated keep-alive timeout may grow to.
+ *
+ * undici only raises the effective window when a response carries
+ * `Keep-Alive: timeout=N`, and caps that at this value. It has to stay at or
+ * above {@link POOLED_IDLE_WINDOW_MS}, or a server's own answer would pull the
+ * window back down below the one this plugin chose.
+ */
+export declare const POOLED_IDLE_MAX_MS = 300000;
+/**
+ * How long one address family gets before the next is dialled alongside it.
+ *
+ * `net` and undici both default to 250 ms. This plugin used to ship 2 500 ms —
+ * ten times longer than anything in the platform — which costs 2.25 s per new
+ * connection on any link where IPv6 is black-holed rather than refused. On this
+ * machine IPv6 refuses in 16 ms, so the old value was masked here and would
+ * only have bitten on the next network; there is no reason to ship it.
+ */
+export declare const HAPPY_EYEBALLS_ATTEMPT_MS = 250;
 /** How long an accepted socket may sit before its first keepalive probe. */
 export declare const TCP_KEEPALIVE_DELAY_MS = 30000;
 /**
@@ -108,6 +135,23 @@ export declare const TCP_KEEPALIVE_DELAY_MS = 30000;
  * @returns options for an undici Agent or ProxyAgent.
  */
 export declare function agentOptionsOf(stability: StabilityConfig): HardenedAgentOptions;
+/**
+ * The connector options every socket this plugin opens is built from.
+ *
+ * One function for three call sites, because `undici`'s `ProxyAgent` does not
+ * read the top-level `connect` object at all: it builds its two connectors from
+ * `proxyTls` (the dial to the proxy) and `requestTls` (the TLS handshake to the
+ * target inside the tunnel), each through `buildConnector({ ...thatOption })`.
+ * Until this was spelled out separately, {@link StabilityConfig.connectTimeoutMs}
+ * reached the direct channel only and the tunnel kept undici's 10 s default —
+ * the very ceiling that turned a measured 10.5 s handshake into
+ * `UND_ERR_CONNECT_TIMEOUT`. `proxy.ts` therefore passes this same object as
+ * both `proxyTls` and `requestTls`, so the ceiling applies where a CONNECT
+ * tunnel is actually established.
+ * @param stability - the effective settings.
+ * @returns connector options for an undici Agent or ProxyAgent.
+ */
+export declare function connectorOptionsOf(stability: StabilityConfig): HardenedConnectOptions;
 /** One short line for the mount log, so the effective budget is never a guess. */
 export declare function describeStability(stability: StabilityConfig): string;
 //# sourceMappingURL=stability.d.ts.map

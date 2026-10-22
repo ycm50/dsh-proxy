@@ -69,15 +69,12 @@ function newHost() {
 /** A config carrying the settings row's values. */
 const settings = {
   proxy: 'http://127.0.0.1:10808',
-  proxyHosts: ['commandcode.ai'],
-  excludeHosts: [],
+  forceHosts: ['commandcode.ai'],
   useSystemProxy: false,
   proxySubprocesses: false,
 }
 const config = (value) => ({
   proxy: { get: () => value.proxy },
-  proxyHosts: { get: () => value.proxyHosts },
-  excludeHosts: { get: () => value.excludeHosts },
   useSystemProxy: { get: () => value.useSystemProxy },
   proxySubprocesses: { get: () => value.proxySubprocesses },
   // Stability refs, present for the same reason the Loader always supplies
@@ -130,7 +127,7 @@ rmSync(reloaded, { recursive: true, force: true })
 // --- 5. Clearing the settings while running still empties the row ---------
 const cleared = newProfile(`${settingsRow(false)}\n${KEEP}`, ['dsh-proxy'])
 const empty = {
-  proxy: '', proxyHosts: [], excludeHosts: [], useSystemProxy: false,
+  proxy: '', forceHosts: [], useSystemProxy: false,
   proxySubprocesses: false,
 }
 check('cleared settings drop the row while running', run(cleared, empty, false), KEEP)
@@ -165,6 +162,43 @@ process.env.DSH_PROFILE_DIR = join(tmpdir(), 'dsh-proxy-unload-nowhere')
 apply(nowhere.ctx, config(settings))
 nowhere.unload()
 check('a missing profile unloads quietly', true, true)
+
+// --- 8. Observation is opt-in, and belongs to the fiber -------------------
+// The observer holds a process-wide diagnostics subscription, so the only two
+// things worth asserting here are that it is off unless asked for, and that a
+// mount which has it on still mounts (and unloads) like any other.
+// The host keeps what the plugin logged, so the wiring is visible from outside.
+function newHostWithLog() {
+  const lines = []
+  const teardowns = []
+  const ctx = {
+    effect(fn) { const disposer = fn(); if (typeof disposer === 'function') teardowns.push(disposer); return disposer },
+    logger: { info: (...args) => lines.push(args.join(' ')), warn: (...args) => lines.push(args.join(' ')), error() {}, debug() {} },
+    on() { return () => {} },
+    get() { return undefined },
+    inject(_deps, callback) { callback(ctx); return () => {} },
+  }
+  return { ctx, lines, unload: () => { for (const disposer of teardowns.splice(0)) disposer() } }
+}
+
+const observing = newProfile(`${settingsRow(false)}\n${KEEP}`, ['dsh-proxy'])
+process.env.DSH_PROFILE_DIR = observing
+
+delete process.env.DSH_PROXY_DEBUG
+const quietHost = newHostWithLog()
+apply(quietHost.ctx, config(settings))
+check('observation stays off without the flag', quietHost.lines.some((line) => line.includes('request observation')), false)
+check('the flag off still routes', quietHost.lines.some((line) => line.includes('routing installed')), true)
+quietHost.unload()
+
+process.env.DSH_PROXY_DEBUG = '1'
+const loudHost = newHostWithLog()
+apply(loudHost.ctx, config(settings))
+check('DSH_PROXY_DEBUG turns observation on', loudHost.lines.some((line) => line.includes('request observation is on')), true)
+check('observation does not replace routing', loudHost.lines.some((line) => line.includes('routing installed')), true)
+loudHost.unload()
+delete process.env.DSH_PROXY_DEBUG
+rmSync(observing, { recursive: true, force: true })
 
 delete process.env.DSH_PROFILE_DIR
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)

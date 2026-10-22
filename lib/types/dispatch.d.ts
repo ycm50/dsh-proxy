@@ -25,6 +25,7 @@
  */
 import { Dispatcher } from 'undici';
 import { isExemptHostname } from './proxy.js';
+import type { DispatchRecord } from './routing.js';
 export { isExemptHostname };
 /** One channel pair plus the per-hostname choice between them. */
 export interface RoutingInput {
@@ -32,8 +33,23 @@ export interface RoutingInput {
     direct: Dispatcher;
     /** Channel for hosts the configuration names. */
     proxied: Dispatcher;
-    /** Whether one hostname travels through the proxy (exclusions already applied). */
+    /** Whether one hostname travels through the proxy (exemptions already applied). */
     proxyFor(hostname: string): boolean;
+    /**
+     * Whether this hostname's channel may move at all.
+     *
+     * A pinned host is always proxied and a loopback/LAN name is always direct, so
+     * neither has a cursor to move; only the hosts in between are observed.
+     */
+    rotateFor?(hostname: string): boolean;
+    /**
+     * Where each dispatched request's outcome is reported.
+     *
+     * The dispatcher is the layer that serves callers which captured `fetch`
+     * before this plugin mounted, so it has to move the same cursor the wrapped
+     * path moves — otherwise those callers retry on one channel forever.
+     */
+    onOutcome?(record: DispatchRecord): void;
 }
 /**
  * A dispatcher that routes one request by its origin.

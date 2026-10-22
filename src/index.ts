@@ -12,6 +12,9 @@
  * @module dsh-proxy
  */
 
+import { appendFileSync, renameSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 // Type-only: pulls in the `Context.settings` augmentation without importing a
 // value, so the module's named exports are not part of this module's link step.
@@ -23,9 +26,10 @@ import type { HttpProxyConfig, PluginConfig } from './config.js'
 import {
   createHardenedChannel,
   createRoutingFetch,
+  isExemptHostname,
   isLoopbackHostname,
   normalizeHostEntry,
-  shouldProxyHostname,
+  shouldForceProxy,
 } from './proxy.js'
 import type { HardenedChannel } from './proxy.js'
 import {
@@ -35,6 +39,10 @@ import {
 } from './dispatch.js'
 import { describeStability, stabilityIsDefault } from './stability.js'
 import type { StabilityConfig } from './stability.js'
+import { observerFromEnv } from './observe.js'
+import type { ProxyObserver } from './observe.js'
+import { ChannelRotation, describeRotation } from './routing.js'
+import type { RouteAttempt } from './routing.js'
 import type { RetryAttempt } from './retry.js'
 import { planRowCleanup, pruneProxyEntryFromProfile, stripProxyEntryConfigFromProfile } from './profile-patch.js'
 import { installSystemProxyRpc } from './rpc.js'
@@ -47,16 +55,17 @@ export {
   createHardenedChannel,
   createProxyFetch,
   createRoutingFetch,
+  headerPairs,
   hostnameOf,
   isLanHostname,
   isLoopbackHostname,
   matchesHostEntry,
+  normaliseFetchCall,
   normalizeHostEntry,
-  shouldProxy,
-  shouldProxyHostname,
+  shouldForceProxy,
   urlOf,
 } from './proxy.js'
-export type { ChannelOptions, HardenedChannel, ProxyFetch } from './proxy.js'
+export type { ChannelOptions, HardenedChannel, NormalisedCall, ProxyFetch, RoutingOptions } from './proxy.js'
 export {
   RoutingDispatcher,
   installGlobalDispatcher,
@@ -67,16 +76,34 @@ export {
 export type { RoutingInput } from './dispatch.js'
 export {
   DEFAULT_STABILITY,
+  HAPPY_EYEBALLS_ATTEMPT_MS,
+  POOLED_IDLE_MAX_MS,
   POOLED_IDLE_WINDOW_MS,
   STABILITY_BOUNDS,
   STABILITY_FIELDS,
   TCP_KEEPALIVE_DELAY_MS,
   agentOptionsOf,
+  connectorOptionsOf,
   describeStability,
   readStability,
   stabilityIsDefault,
 } from './stability.js'
-export type { HardenedAgentOptions, StabilityConfig, StabilityField } from './stability.js'
+export type { HardenedAgentOptions, HardenedConnectOptions, StabilityConfig, StabilityField } from './stability.js'
+export { ProxyObserver, observerFromEnv } from './observe.js'
+export type {
+  ObservedChannel,
+  ObserverOptions,
+  ObserverStats,
+  ObserverSummary,
+  RequestSample,
+} from './observe.js'
+export {
+  ChannelRotation,
+  FIRST_CHANNEL,
+  describeRotation,
+  otherChannel,
+} from './routing.js'
+export type { RouteAttempt, RouteChannel } from './routing.js'
 export {
   isAborted,
   isReplayableRequest,
@@ -186,22 +213,20 @@ const SUBPROCESS_ENV_NAMES = {
 const NODE_USE_ENV_PROXY = 'NODE_USE_ENV_PROXY'
 
 /**
- * The `NO_PROXY` value a child receives: loopback, the machine's own entries,
- * and this plugin's exclusions.
+ * The `NO_PROXY` value a child receives: loopback plus whatever the machine
+ * already exported.
  *
- * Exclusions are the highest-priority input, so they belong in the child's
- * bypass list too: a host that must not go through the proxy here must not go
- * through it there either. `NO_PROXY` matching is the same umbrella idea one
- * level up — a name covers itself and its subdomains — so the entries carry
- * over unchanged, and a name the child's matcher cannot express bypasses
- * nothing rather than everything.
- * @param exclude - normalized exclusion entries.
+ * There is no list to fold in any more: the only list the plugin still has is
+ * the force list, and a child that inherited the proxy for a pinned host is
+ * exactly what the export is for. `NO_PROXY` matching is the umbrella idea one
+ * level up — a name covers itself and its subdomains — so the machine's own
+ * entries carry over unchanged, and a name the child's matcher cannot express
+ * bypasses nothing rather than everything.
  * @param pristine - the machine's own environment, or `undefined` before the
  * first claim captured it (in which case there is nothing of its own to keep).
  * @returns the comma-separated bypass list.
  */
 function noProxyValue(
-  exclude: ReadonlySet<string>,
   pristine: ReadonlyMap<string, string | undefined> | undefined,
 ): string {
   const entries = new Set<string>(LOOPBACK_NO_PROXY)
@@ -217,7 +242,6 @@ function noProxyValue(
       if (trimmed.length > 0) entries.add(trimmed)
     }
   }
-  for (const entry of exclude) entries.add(entry)
   return [...entries].join(',')
 }
 
@@ -295,7 +319,7 @@ function uninstallWrapper(token: symbol): void {
  * re-derives it from whatever is left, and the machine's own values come back
  * only when the last claim goes.
  */
-const exportClaims = new Map<symbol, { proxyUrl: string; exclude: ReadonlySet<string> }>()
+const exportClaims = new Map<symbol, { proxyUrl: string }>()
 
 /**
  * The machine's own environment, captured once before the first claim wrote,
@@ -320,7 +344,7 @@ const EXPORT_ENV_NAMES: readonly string[] = [
  * when there is none left.
  */
 function applyExport(): void {
-  let newest: { proxyUrl: string; exclude: ReadonlySet<string> } | undefined
+  let newest: { proxyUrl: string } | undefined
   for (const claim of exportClaims.values()) newest = claim
   if (newest === undefined) {
     const pristine = pristineEnv
@@ -332,7 +356,7 @@ function applyExport(): void {
     }
     return
   }
-  const noProxy = noProxyValue(newest.exclude, pristineEnv)
+  const noProxy = noProxyValue(pristineEnv)
   for (const name of SUBPROCESS_ENV_NAMES.httpProxy) process.env[name] = newest.proxyUrl
   for (const name of SUBPROCESS_ENV_NAMES.httpsProxy) process.env[name] = newest.proxyUrl
   for (const name of SUBPROCESS_ENV_NAMES.noProxy) process.env[name] = noProxy
@@ -354,12 +378,10 @@ function applyExport(): void {
  * outright. Callers check {@link isValidSubprocessProxy} first, and an invalid
  * URL leaves the environment untouched.
  * @param proxyUrl - the resolved proxy URL (already known to be valid).
- * @param exclude - normalized exclusion entries for the child's `NO_PROXY`.
  * @returns a token identifying this claim, for {@link releaseSubprocessExport}.
  */
 function claimSubprocessExport(
   proxyUrl: string,
-  exclude: ReadonlySet<string>,
 ): symbol {
   if (pristineEnv === undefined) {
     const pristine = new Map<string, string | undefined>()
@@ -367,7 +389,7 @@ function claimSubprocessExport(
     pristineEnv = pristine
   }
   const token = Symbol('dsh-proxy subprocess export')
-  exportClaims.set(token, { proxyUrl, exclude })
+  exportClaims.set(token, { proxyUrl })
   applyExport()
   return token
 }
@@ -390,57 +412,30 @@ function releaseSubprocessExport(token: symbol): boolean {
   return true
 }
 /**
- * The two umbrella sets one routing decision is made of.
+ * Collect the one hostname set a routing decision is made from: the force list.
  *
- * They stay apart on purpose: an exclusion is not a subtraction from the
- * routed set (that could only remove an entry spelled identically, so
- * excluding `a.b` would leave `api.a.b` routed), but a second, higher-priority
- * umbrella test at decision time.
- */
-interface ProxyTargets {
-  /** Entries routed through the proxy. */
-  hosts: Set<string>
-  /** Entries kept direct, whatever `hosts` says. */
-  exclude: Set<string>
-}
-
-/**
- * Collect the hostnames that should travel through the proxy.
+ * It is the only list left. A pinned host always travels through the proxy and
+ * never alternates channels; every other host starts direct and rotates to the
+ * proxy on its retries (see `dsh-proxy/routing`), so there is no second list to
+ * judge against and no exclusion to subtract — the settings page can promise
+ * exactly that.
  *
- * The configured `proxyHosts` is the whole routed set — there is no
- * auto-detected list behind it, so an empty list routes nothing and the
- * settings page can promise exactly that. `excludeHosts` comes back beside
- * it as a separate set because it is judged first and cannot be expressed as
- * a subtraction from the routed set (see {@link ProxyTargets}).
- *
- * Every entry is an umbrella: `a.b` covers `a.b` and the whole subtree under
- * it (see `matchesHostEntry`), so a domain is named once rather than per
- * endpoint.
- * @param ctx - the Cordis context, for the optional settings service.
+ * Every entry is an umbrella: `a.b` covers `a.b` and the whole subtree under it
+ * (see `matchesHostEntry`), so a domain is named once rather than per endpoint.
  * @param config - the current plugin configuration.
- * @returns the routed and excluded entry sets.
+ * @returns the pinned entry set.
  */
-function collectProxyHosts(config: HttpProxyConfig): ProxyTargets {
-  // The routed list is exactly what the configuration names. An empty list
-  // routes nothing: there is no auto-detected set behind it, so "no domains"
-  // and "no proxying" are the same statement and the settings page says so.
+function collectForceHosts(config: HttpProxyConfig): Set<string> {
   // Entries are normalized so mixed case, `host:port`, pasted URLs, and
   // `*.domain` / `.domain` spellings all land on the same umbrella.
-  const hosts = new Set<string>()
-  for (const host of config.proxyHosts) {
+  const force = new Set<string>()
+  for (const host of config.forceHosts) {
     const normalized = normalizeHostEntry(host)
-    if (normalized !== undefined) hosts.add(normalized)
+    if (normalized !== undefined) force.add(normalized)
   }
-  // Exclusions are the highest-priority input there is: an excluded host goes
-  // direct without the routed list being consulted, so it wins even when the
-  // same domain is named in both.
-  const exclude = new Set<string>()
-  for (const host of config.excludeHosts) {
-    const normalized = normalizeHostEntry(host)
-    if (normalized !== undefined) exclude.add(normalized)
-  }
-  return { hosts, exclude }
+  return force
 }
+
 /** Whether two hostname sets hold the same hosts (sets are small; order-free compare). */
 function sameHostSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
   if (left.size !== right.size) return false
@@ -450,18 +445,15 @@ function sameHostSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boo
   return true
 }
 
-/** Whether two target pairs would route identically. */
-function sameTargets(left: ProxyTargets, right: ProxyTargets): boolean {
-  return sameHostSet(left.hosts, right.hosts) && sameHostSet(left.exclude, right.exclude)
-}
-
 /**
  * Whether two stability snapshots would build the same channels.
  *
  * A connection pool carries the timeouts it was built with, so a change to any
- * of them has to rebuild. Together with the proxy address and the host lists
+ * of them has to rebuild. Together with the proxy address and the force list
  * this decides whether a volatile update touches the request path at all: an
- * unrelated edit must not re-dial every idle connection.
+ * unrelated edit must not re-dial every idle connection. The retry budget is
+ * part of the identity too — the routing wrapper is built from it, so an edit to
+ * `retryCount` has to reach the next request.
  * @param left - the settings the live generation was built from.
  * @param right - the settings the current configuration resolves to.
  * @returns whether the live channels may be kept.
@@ -473,6 +465,101 @@ function sameStability(left: StabilityConfig, right: StabilityConfig): boolean {
     && left.retryCount === right.retryCount
     && left.retryDelayMs === right.retryDelayMs
     && left.retryOnPossibleDelivery === right.retryOnPossibleDelivery
+}
+
+/** Where the record file lives when the environment does not name one. */
+export function defaultRecordPath(env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.DSH_HOME !== undefined && env.DSH_HOME.length > 0
+    ? env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'dsh-proxy.log')
+}
+
+/** The size above which the record file is rolled over to `<path>.1`. */
+const RECORD_MAX_BYTES = 4 * 1024 * 1024
+
+/** Read one volatile boolean field, tolerating a configuration that predates it. */
+function liveFlag(reference: unknown): boolean {
+  const field = reference as { get?: () => unknown } | undefined
+  try {
+    return field !== undefined && typeof field.get === 'function' && field.get() === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Where one record line goes: the host log, and — while the switch is on — a
+ * file beside it.
+ *
+ * The file is the point. The desktop build's host log is not written anywhere
+ * the user can read, so without it the record the rotation produces — which
+ * channel each attempt took, and why it failed — is invisible exactly when it
+ * matters. Writing it is therefore a **switch**: `debugLog` in the settings
+ * page, read live, so turning it on records the next attempt without a restart.
+ * A non-empty `DSH_PROXY_LOG` turns it on too, for capturing a start-up that
+ * never gets as far as the settings page, and overrides the path.
+ *
+ * The file is capped: past {@link RECORD_MAX_BYTES} it is rolled to `<path>.1`
+ * and started fresh, so a long capture cannot fill a disk. A write failure is
+ * swallowed for the same reason the plugin never fails a request over a
+ * diagnostic.
+ * @param ctx - the Cordis context, for the logger.
+ * @param enabled - reads the live switch.
+ * @returns the sink every record line goes through.
+ */
+function recordSink(ctx: Context, enabled: () => boolean): (line: string) => void {
+  const configured = (process.env.DSH_PROXY_LOG ?? '').trim()
+  const forcedByEnv = configured.length > 0
+  const file = forcedByEnv ? configured : defaultRecordPath()
+  let announced = false
+  return (line) => {
+    ctx.logger.info('%s', line)
+    if (!forcedByEnv && !enabled()) {
+      announced = false
+      return
+    }
+    try {
+      if (!announced) {
+        announced = true
+        appendFileSync(file, 'dsh-proxy: record on — appending to ' + file + '\n', 'utf8')
+      }
+      const size = statSync(file, { throwIfNoEntry: false })?.size ?? 0
+      if (size > RECORD_MAX_BYTES) renameSync(file, file + '.1')
+      appendFileSync(file, line + '\n', 'utf8')
+    } catch {
+      /* a record that cannot be written is not a reason to fail the request */
+    }
+  }
+}
+
+/**
+ * Build this instance's per-attempt recorder.
+ *
+ * The user asked for the rotation to be visible, so every attempt is written
+ * down: which channel it took, which attempt it was, what it cost, and — when it
+ * failed — the transport code that moved the host to the other channel. A
+ * successful first attempt is the common case and stays a single short line; the
+ * interesting shape (direct failing, proxy answering) is exactly the pair of
+ * lines that explains a bad path.
+ * @param ctx - the Cordis context, for the logger.
+ * @returns the recorder handed to the routing wrapper.
+ */
+function makeAttemptRecorder(sink: (line: string) => void): (attempt: RouteAttempt) => void {
+  return (attempt) => {
+    const outcome = attempt.ok
+      ? 'ok'
+      : 'failed' + (attempt.code !== undefined && attempt.code.length > 0 ? ' ' + attempt.code : '')
+    const next = attempt.attempt < attempt.maxAttempts
+      ? 'next attempt takes the other channel'
+      : 'no attempts left'
+    sink(
+      'dsh-proxy: ' + (attempt.hostname.length > 0 ? attempt.hostname : '(unparseable url)')
+      + ' attempt ' + String(attempt.attempt) + '/' + String(attempt.maxAttempts)
+      + ' via ' + attempt.channel + ' -> ' + outcome
+      + ' in ' + String(attempt.ms) + 'ms (' + next + ')',
+    )
+  }
 }
 
 /**
@@ -529,9 +616,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
    */
   let active: {
     proxyUrl: string
-    targets: ProxyTargets
+    force: Set<string>
     stability: StabilityConfig
     routing: RoutingDispatcher
+    rotation: ChannelRotation
   } | undefined
   /** This instance's live global-dispatcher install, when it holds one. */
   let dispatcherInstalled: symbol | undefined
@@ -555,8 +643,27 @@ export function apply(ctx: Context, config: PluginConfig): void {
    * no system-proxy switch.
    */
   let vacant = true
+  /**
+   * Opt-in request timing (`DSH_PROXY_DEBUG`), one per instance.
+   *
+   * It outlives a single generation on purpose: a settings refresh must not lose
+   * the samples that explain the request before it. Off by default — without the
+   * flag nothing subscribes to undici's diagnostics channel and no request is
+   * timed at all.
+   */
+  const sink = recordSink(ctx, () => liveFlag(config.debugLog))
+  const observer: ProxyObserver | undefined = observerFromEnv(process.env.DSH_PROXY_DEBUG, {
+    log: (line) => ctx.logger.info('%s', line),
+    summaryEvery: 20,
+  })
+  if (observer !== undefined) {
+    ctx.logger.info(
+      'dsh-proxy: request observation is on (DSH_PROXY_DEBUG) — one line per request, a summary every 20',
+    )
+  }
 
   const deactivate = (): void => {
+    sink('dsh-proxy: routing deactivated (the wrapper and the dispatcher are being retired)')
     // Retire both global references first, so no request can land on the
     // channels this is about to close. Each slot re-points at another live
     // instance when there is one, so unloading the older of two mounted
@@ -718,15 +825,14 @@ export function apply(ctx: Context, config: PluginConfig): void {
       ? detected
       : (cfg.proxy.length > 0 ? cfg.proxy : (process.env.DSH_HTTP_PROXY ?? ''))
     if (system !== undefined) reportSystemProxy(system, proxyUrl)
-    // Nothing configured at all — no proxy URL, no routed hosts, no
-    // exclusions, no system-proxy switch, and not the subprocess switch —
-    // means the profile row carries nothing, so it goes back out (see
-    // `scrubProfile`). A row that still holds settings stays. The switch
-    // counts as information on purpose: `false` is its default, so a stored
-    // `true` is exactly what the row is for, and dropping the row would
-    // forget it.
-    vacant = proxyUrl.length === 0 && cfg.proxyHosts.length === 0 && cfg.excludeHosts.length === 0
-      && !cfg.useSystemProxy && !cfg.proxySubprocesses
+    // Nothing configured at all — no proxy URL, no pinned hosts, no
+    // system-proxy switch, and not the subprocess switch — means the profile row
+    // carries nothing, so it goes back out (see `scrubProfile`). A row that still
+    // holds settings stays. The switch counts as information on purpose: `false`
+    // is its default, so a stored `true` is exactly what the row is for, and
+    // dropping the row would forget it.
+    vacant = proxyUrl.length === 0 && cfg.forceHosts.length === 0
+      && !cfg.useSystemProxy && !cfg.proxySubprocesses && !cfg.debugLog
       // A stability value away from its default is information this row
       // carries: it must survive while it is set, and the cleanup rules above
       // must not treat the row as empty.
@@ -742,7 +848,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       if (vacant) cleanProfileIfOff('cleared settings')
       return
     }
-    const targets = collectProxyHosts(cfg)
+    const force = collectForceHosts(cfg)
     // The child-process export is reconciled on every refresh, not only when
     // the in-process wrapper changes: flipping its own switch must take
     // effect on the next install without a restart. The previous export is
@@ -752,7 +858,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     dropSubprocess()
     if (cfg.proxySubprocesses) {
       if (isValidSubprocessProxy(proxyUrl)) {
-        subprocess = claimSubprocessExport(proxyUrl, targets.exclude)
+        subprocess = claimSubprocessExport(proxyUrl)
       } else {
         // Deliberately not a failure: an address built for SOCKS serves the
         // in-process wrapper but cannot be handed to a Node child without
@@ -764,32 +870,62 @@ export function apply(ctx: Context, config: PluginConfig): void {
       }
     }
     // No config actually moved: keep the current channels and wrapper, so an
-    // unrelated volatile update never tears down in-flight connections.
+    // unrelated volatile update never tears down in-flight connections. The
+    // retry budget is part of the stability snapshot, which is compared here
+    // too, so an edit to it reaches the next request.
     if (
       active !== undefined
       && active.proxyUrl === proxyUrl
-      && sameTargets(active.targets, targets)
+      && sameHostSet(active.force, force)
       && sameStability(active.stability, stability)
     ) return
     let direct: HardenedChannel
     let proxied: HardenedChannel
     let routing: RoutingDispatcher
+    let rotation: ChannelRotation
+    let onAttempt: (attempt: RouteAttempt) => void
+    let onRetry: (attempt: RetryAttempt) => void
     try {
       // `assertValid` guards the interactive path, but the `DSH_HTTP_PROXY`
       // fallback bypasses it — judge the resolved URL here too, so a bad value
       // degrades to "routing off" instead of failing the plugin mount.
       assertValid({ proxy: proxyUrl })
-      const onRetry = makeRetryReporter(ctx)
+      onRetry = makeRetryReporter(ctx)
       // Both channels are this plugin's own: a host the configuration does not
-      // name still gets the long connect ceiling, the keepalive, and the
-      // transport retry, rather than falling back to undici's 10 second
-      // connect timeout — the failure this plugin exists to remove.
-      direct = createHardenedChannel(undefined, { stability, onRetry })
-      proxied = createHardenedChannel(proxyUrl, { stability, onRetry })
+      // name still gets the long connect ceiling and the keepalive, rather than
+      // falling back to undici's 10 second connect timeout — the failure this
+      // plugin exists to remove. The retry budget is deliberately *not* given to
+      // the channels: the routing wrapper runs the retry loop, because each
+      // attempt has to take a different channel (see `dsh-proxy/routing`).
+      const observation = observer === undefined ? {} : { observer }
+      const channelStability = { ...stability, retryCount: 0 }
+      direct = createHardenedChannel(undefined, { stability: channelStability, onRetry, ...observation })
+      proxied = createHardenedChannel(proxyUrl, { stability: channelStability, onRetry, ...observation })
+      // One rotation per generation: which channel a host is on is a function of
+      // the failures that generation saw, so a rebuilt generation starts every
+      // host from direct again.
+      rotation = new ChannelRotation()
+      onAttempt = makeAttemptRecorder(sink)
       routing = new RoutingDispatcher({
         direct: direct.dispatcher,
         proxied: proxied.dispatcher,
-        proxyFor: (hostname) => shouldProxyHostname(hostname, targets.hosts, targets.exclude),
+        // Synchronous by contract, and pure: the channel is read from the
+        // rotation, never advanced here.
+        proxyFor: (hostname) => !isExemptHostname(hostname)
+          && (shouldForceProxy(hostname, force) || rotation.channelFor(hostname) === 'proxy'),
+        // The dispatcher serves the callers that captured `fetch` before this
+        // plugin mounted, so it has to move the same cursor the wrapped path
+        // moves — otherwise those callers retry on one channel forever, which
+        // is exactly the "four attempts, none of them connected" shape.
+        rotateFor: (hostname) => !isExemptHostname(hostname) && !shouldForceProxy(hostname, force),
+        onOutcome: (record) => {
+          const next = rotation.record(record.hostname)
+          sink(
+            'dsh-proxy: ' + record.hostname + ' via ' + record.channel + ' (dispatcher) -> '
+            + (record.ok ? 'ok' : 'failed' + (record.code === undefined || record.code.length === 0 ? '' : ' ' + record.code))
+            + ' in ' + String(record.ms) + 'ms (next via ' + next + ')',
+          )
+        },
       })
     } catch (cause) {
       ctx.logger.warn(
@@ -802,7 +938,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
       dropSubprocess()
       return
     }
-    const next = { proxyUrl, targets, stability, routing }
+    sink(
+      'dsh-proxy: routing generation installed — proxy=' + proxyUrl
+      + ' forced=' + String(force.size)
+      + ' retry=' + String(stability.retryCount) + 'x' + String(stability.retryDelayMs) + 'ms'
+      + ' rotate=' + describeRotation(Math.max(1, 1 + stability.retryCount)),
+    )
+    const next = { proxyUrl, force, stability, routing, rotation }
     const previous = active
     active = next
     // Retire this instance's previous wrapper *before* looking at the global:
@@ -826,15 +968,28 @@ export function apply(ctx: Context, config: PluginConfig): void {
     const dispatcherToken = Symbol('dsh-proxy dispatcher')
     installGlobalDispatcher(dispatcherToken, routing)
     dispatcherInstalled = dispatcherToken
-    const wrapper = createRoutingFetch(proxied.fetch, direct.fetch, targets.hosts, targets.exclude)
+    const wrapper = createRoutingFetch({
+      proxy: proxied.fetch,
+      direct: direct.fetch,
+    }, rotation, {
+      retryCount: stability.retryCount,
+      baseDelayMs: stability.retryDelayMs,
+      retryOnPossibleDelivery: stability.retryOnPossibleDelivery,
+      // The force list, and only the force list: the routing layer applies the
+      // built-in loopback/LAN exemption itself, so a pinned name can never be
+      // made to leave the machine.
+      forcedProxy: (hostname) => shouldForceProxy(hostname, force),
+      onAttempt,
+      onRetry,
+    })
     const token = Symbol('dsh-proxy wrapper')
     installWrapper(token, wrapper)
     installed = token
     ctx.logger.info(
-      'dsh-proxy: routing installed — proxied hosts %d, exclusions %d, %s',
-      targets.hosts.size,
-      targets.exclude.size,
+      'dsh-proxy: routing installed — forced hosts %d, %s, %s',
+      force.size,
       describeStability(stability),
+      describeRotation(Math.max(1, 1 + stability.retryCount)),
     )
     // Publish the new wrapper before closing the old dispatcher, so requests
     // started after this point always land on the live dispatcher.
@@ -860,6 +1015,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
     // reads DSH's own persistent state to tell the two apart — a bundle the
     // profile no longer selects, or a row carrying `disabled: true`.
     cleanProfileIfOff('plugin unloaded')
+    // The observer holds a process-wide subscription; it must not outlive the
+    // fiber that installed it.
+    observer?.dispose()
   })
 
   // DSH edits this plugin's configuration in place: the Loader commits the new

@@ -21,14 +21,14 @@ import type { SystemProxyReading } from '../rpc-contract.js';
 export interface HttpProxySettings {
     /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
     proxy?: string;
-    /** Hostnames to proxy, with their subdomains (empty = proxy nothing). */
-    proxyHosts?: string[];
-    /** Hostnames never proxied. */
-    excludeHosts?: string[];
+    /** Hostnames pinned to the proxy: always proxied, never alternated. */
+    forceHosts?: string[];
     /** Whether the machine's own proxy configuration supplies the address. */
     useSystemProxy?: boolean;
     /** Whether child processes (plugin install/update) inherit the proxy. */
     proxySubprocesses?: boolean;
+    /** Whether the attempt record is appended to a file. */
+    debugLog?: boolean;
     /** Ceiling for a TCP connect and for a proxy CONNECT tunnel, in milliseconds. */
     connectTimeoutMs?: number;
     /** Ceiling for waiting on response headers; 0 disables the watchdog. */
@@ -48,10 +48,10 @@ export interface PiAiSettings {
         baseURL?: string;
     }>;
 }
-/** The two host-list fields, which share one control shape. */
-export type HostFieldName = 'proxyHosts' | 'excludeHosts';
-/** The staged on/off switches of the stability group, and the subprocess one. */
-export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'retryOnPossibleDelivery';
+/** The host-list field, which has the one control shape. */
+export type HostFieldName = 'forceHosts';
+/** The staged on/off switches: the subprocess one and the retry-safety one. */
+export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'debugLog' | 'retryOnPossibleDelivery';
 /**
  * The numeric fields of the stability group.
  *
@@ -66,28 +66,27 @@ export type FieldName = 'proxy' | HostFieldName | BooleanFieldName | NumberField
 export interface HttpProxyFormState extends SettingsFormShell {
     /** Staged proxy URL. */
     proxy: SettingsFieldState;
-    /** Staged proxy-only hosts, comma/whitespace separated. */
-    proxyHosts: SettingsFieldState;
-    /** Staged excluded hosts, comma/whitespace separated. */
-    excludeHosts: SettingsFieldState;
+    /** Staged always-proxied hosts, comma/whitespace separated. */
+    forceHosts: SettingsFieldState;
     /** Staged "use the system proxy" switch. */
     useSystemProxy: SettingsFieldState;
-    /** Staged "route every request through the proxy" switch. */
     /** Staged "child processes inherit the proxy" switch. */
     proxySubprocesses: SettingsFieldState;
+    /** Staged "append the attempt record to a file" switch. */
+    debugLog: SettingsFieldState;
     /** Staged connect ceiling, in milliseconds. */
     connectTimeoutMs: SettingsFieldState;
     /** Staged response-header ceiling, in milliseconds. */
     responseTimeoutMs: SettingsFieldState;
     /** Staged streaming idle ceiling, in milliseconds. */
     streamIdleTimeoutMs: SettingsFieldState;
-    /** Staged connection retry budget. */
+    /** Staged connection retry budget (attempts after the first). */
     retryCount: SettingsFieldState;
     /** Staged first backoff delay, in milliseconds. */
     retryDelayMs: SettingsFieldState;
     /** Staged "retry a possibly-delivered failure too" switch. */
     retryOnPossibleDelivery: SettingsFieldState;
-    /** Known model hostnames offered beside the host fields (free text still allowed). */
+    /** Known model hostnames offered beside the host field (free text still allowed). */
     suggestions: string[];
 }
 /** One answer to the page's "read the system proxy" request. */
@@ -147,7 +146,7 @@ export declare class HttpProxyFormController {
     private publish;
     private projection;
     /**
-     * Hostnames offered by the host fields as a convenience: the default
+     * Hostnames offered by the host field as a convenience: the default
      * DeepSeek host, the built-in pi-ai catalog endpoints, every configured
      * gateway, and what is already saved. The list is a pick list only — it does
      * not decide what is routed.

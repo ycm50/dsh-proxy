@@ -98,7 +98,7 @@ let registeredDictionaries
 
 const snapshot = {
   status: 'ready',
-  value: { proxy: 'socks5://127.0.0.1:7890', proxyHosts: ['gateway.acme.example'], excludeHosts: [] },
+  value: { proxy: 'socks5://127.0.0.1:7890', forceHosts: ['gateway.acme.example'] },
   base: {},
   user: { proxy: 'socks5://127.0.0.1:7890' },
   revision: 1,
@@ -200,7 +200,7 @@ check('page renders the one-line intro', page.includes('«description»'))
 check('page renders the form frame', page.includes('«save»'))
 check('page renders the proxy control with its stored value', page.includes('socks5://127.0.0.1:7890'))
 check('page renders the proxy label', page.includes('«proxy»'))
-check('page renders both host fields', page.includes('dsh-proxy-hosts') && page.includes('dsh-proxy-exclude'))
+check('page renders the one host field', page.includes('dsh-proxy-force'))
 check('page renders the stored host list as text', page.includes('gateway.acme.example'))
 check('page offers the known-host pick list', page.includes('«suggestions»'))
 check('page marks the saved proxy overridden', page.includes('«overridden»'))
@@ -210,9 +210,10 @@ check('page marks the saved proxy overridden', page.includes('«overridden»'))
 // the exact total follow from that.
 //
 // Composition as actually rendered (verified against the built bundle):
-//   text fields (8): dsh-proxy-url, dsh-proxy-hosts, dsh-proxy-exclude, and the
-//                    five stability numbers
-//   checkboxes  (3): useSystemProxy, proxySubprocesses, retryOnPossibleDelivery
+//   text fields (7): dsh-proxy-url, dsh-proxy-force, and the five stability
+//                    numbers
+//   checkboxes  (4): useSystemProxy, proxySubprocesses, debugLog,
+//                    retryOnPossibleDelivery
 const stabilityNumberIds = [
   'dsh-proxy-connect-timeout',
   'dsh-proxy-response-timeout',
@@ -220,8 +221,8 @@ const stabilityNumberIds = [
   'dsh-proxy-retry-count',
   'dsh-proxy-retry-delay',
 ]
-const textInputIds = ['dsh-proxy-url', 'dsh-proxy-hosts', 'dsh-proxy-exclude', ...stabilityNumberIds]
-const checkboxFields = ['useSystemProxy', 'dsh-proxy-subprocesses', 'dsh-proxy-retry-possible']
+const textInputIds = ['dsh-proxy-url', 'dsh-proxy-force', ...stabilityNumberIds]
+const checkboxFields = ['useSystemProxy', 'dsh-proxy-subprocesses', 'dsh-proxy-debug-log', 'dsh-proxy-retry-possible']
 const inputTags = page.match(/<input\b[^>]*>/g) ?? []
 const isCheckbox = tag => tag.includes('type="checkbox"')
 check('page renders every named text field',
@@ -236,7 +237,21 @@ check('page renders one input per control, and no others',
   && inputTags.filter(tag => !isCheckbox(tag)).length === textInputIds.length,
   `total=${inputTags.length} checkbox=${inputTags.filter(isCheckbox).length} text=${inputTags.filter(tag => !isCheckbox(tag)).length}`)
 check('page renders the subprocess switch copy', page.includes('«proxySubprocesses»'))
+check('page renders the record switch with its copy',
+  page.includes('data-field="dsh-proxy-debug-log"') && page.includes('«debugLog»') && page.includes('«debugLogHint»'))
 check('page renders the system-proxy switch', page.includes('type="checkbox"') && page.includes('«useSystemProxy»'))
+// The page is split into four named groups, and the host group carries three
+// lists whose precedence is the whole point: excluded > forced > auto.
+check('page renders the connection group',
+  page.includes('dsh-proxy-connection-heading') && page.includes('«connectionHint»'))
+check('page renders the hosts group',
+  page.includes('dsh-proxy-domains-heading') && page.includes('«domainsHint»'))
+check('page renders the always-proxied list',
+  page.includes('«force»') && page.includes('«forceHint»') && page.includes('id="dsh-proxy-force"'))
+// There is no channel-choice group any more: the rotation is the shipped
+// strategy, not a set of knobs, so the page must not offer one.
+check('the page offers no channel-choice group',
+  !page.includes('dsh-proxy-routing-heading') && !page.includes('dsh-proxy-auto-route'))
 // The stability group: every number carries both a label and its hint, and the
 // hints are where the "not below 30000" guidance lives.
 check('page renders the stability heading and its hint',
@@ -269,7 +284,7 @@ if (process.env.SMOKE_HTML) console.log(`\n--- rendered page ---\n${page.replace
 
 // The host field's text must round-trip through the shared form model, and a
 // pristine page must offer no write.
-check('host field text round-trips', face.hooks.httpProxyForm.getSnapshot().proxyHosts.text === 'gateway.acme.example')
+check('host field text round-trips', face.hooks.httpProxyForm.getSnapshot().forceHosts.text === 'gateway.acme.example')
 check('an untouched page has nothing to save', face.hooks.httpProxyForm.getSnapshot().dirty === false)
 check('an untouched page is not marked invalid', face.hooks.httpProxyForm.getSnapshot().invalid === false)
 

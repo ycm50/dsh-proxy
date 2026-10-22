@@ -27,6 +27,8 @@
 import { Dispatcher, getGlobalDispatcher, setGlobalDispatcher } from 'undici'
 import { hostnameOf } from './hosts.js'
 import { isExemptHostname } from './proxy.js'
+import { transportCodeOf } from './retry.js'
+import type { DispatchRecord, RouteChannel } from './routing.js'
 
 export { isExemptHostname }
 
@@ -36,8 +38,23 @@ export interface RoutingInput {
   direct: Dispatcher
   /** Channel for hosts the configuration names. */
   proxied: Dispatcher
-  /** Whether one hostname travels through the proxy (exclusions already applied). */
+  /** Whether one hostname travels through the proxy (exemptions already applied). */
   proxyFor(hostname: string): boolean
+  /**
+   * Whether this hostname's channel may move at all.
+   *
+   * A pinned host is always proxied and a loopback/LAN name is always direct, so
+   * neither has a cursor to move; only the hosts in between are observed.
+   */
+  rotateFor?(hostname: string): boolean
+  /**
+   * Where each dispatched request's outcome is reported.
+   *
+   * The dispatcher is the layer that serves callers which captured `fetch`
+   * before this plugin mounted, so it has to move the same cursor the wrapped
+   * path moves — otherwise those callers retry on one channel forever.
+   */
+  onOutcome?(record: DispatchRecord): void
 }
 
 /**
@@ -60,18 +77,60 @@ export class RoutingDispatcher extends Dispatcher {
   /** @inheritdoc */
   override dispatch(options: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
     let target = this.input.direct
+    let channel: RouteChannel = 'direct'
+    let hostname = ''
     const origin = options?.origin
     if (origin !== undefined && origin !== null) {
       try {
-        const hostname = hostnameOf(origin as string | URL)
-        if (hostname.length > 0 && !isExemptHostname(hostname) && this.input.proxyFor(hostname)) {
-          target = this.input.proxied
-        }
+        hostname = hostnameOf(origin as string | URL)
       } catch {
-        target = this.input.direct
+        hostname = ''
       }
     }
-    return target.dispatch(options, handler)
+    if (hostname.length > 0 && !isExemptHostname(hostname) && this.input.proxyFor(hostname)) {
+      target = this.input.proxied
+      channel = 'proxy'
+    }
+    const onOutcome = this.input.onOutcome
+    // Only a host that may move is observed: watching a pinned or loopback host
+    // would cost a handler wrapper for an answer nothing can act on.
+    const observe = onOutcome !== undefined
+      && hostname.length > 0
+      && (this.input.rotateFor?.(hostname) ?? false)
+    if (!observe) return target.dispatch(options, handler)
+    const startedAt = performance.now()
+    let settled = false
+    const settle = (ok: boolean, code?: string): void => {
+      if (settled) return
+      settled = true
+      onOutcome({
+        hostname,
+        channel,
+        ok,
+        ms: Math.round(performance.now() - startedAt),
+        ...(code === undefined ? {} : { code }),
+      })
+    }
+    // Field-for-field forwarding with one addition: the two callbacks that say
+    // how the attempt ended also move the host's cursor.
+    const observed: Dispatcher.DispatchHandler = {
+      onConnect: (abort) => { handler.onConnect?.(abort) },
+      onHeaders: (statusCode, rawHeaders, resume, statusText) => {
+        settle(true)
+        return handler.onHeaders?.(statusCode, rawHeaders, resume, statusText) ?? false
+      },
+      onData: (chunk) => handler.onData?.(chunk) ?? false,
+      onComplete: (trailers) => { handler.onComplete?.(trailers) },
+      onError: (error) => {
+        settle(false, transportCodeOf(error))
+        handler.onError?.(error)
+      },
+      onUpgrade: (statusCode, rawHeaders, socket) => {
+        settle(true)
+        handler.onUpgrade?.(statusCode, rawHeaders, socket)
+      },
+    }
+    return target.dispatch(options, observed)
   }
 
   /** Close both channels, waiting for in-flight requests. */

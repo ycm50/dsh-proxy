@@ -42,16 +42,15 @@ export interface HttpProxyConfig {
    */
   proxy: string
   /**
-   * Hostnames routed through the proxy, each an umbrella covering itself and
-   * its subdomains. This is the entire routed set: there is no auto-detected
-   * list behind it, so an empty array routes nothing at all.
+   * Hostnames pinned to the proxy: the only list there is.
+   *
+   * A host named here always travels through the proxy and never alternates
+   * channels. It is the answer for a site that is reachable directly but
+   * throttled hard enough that trying is pointless — a mirror that answers in
+   * 30 s direct and in 2 s through the proxy. Every other host starts direct and
+   * rotates to the proxy on its retries (see `dsh-proxy/routing`).
    */
-  proxyHosts: string[]
-  /**
-   * Hostnames that must never be routed. Judged before `proxyHosts`, so an
-   * entry here is direct even when the same host is also listed there.
-   */
-  excludeHosts: string[]
+  forceHosts: string[]
   /**
    * Whether to take the proxy address from the operating system instead of the
    * typed one. When set, the machine's own configuration is read for every
@@ -70,11 +69,21 @@ export interface HttpProxyConfig {
    * never injected; see {@link isValidSubprocessProxy}.
    *
    * It is independent of the host lists: it carries the same resolved address
-   * to the programs that cannot see the in-process routing, and an
-   * `excludeHosts` entry cannot carve out a child process, so the address a
+   * to the programs that cannot see the in-process routing, so the address a
    * child inherits is the one routing itself uses.
    */
   proxySubprocesses: boolean
+  /**
+   * Whether the attempt record is appended to a file.
+   *
+   * Off by default: a diagnostic that writes files unasked is a surprise. On, it
+   * writes one line per attempt (channel, attempt number, outcome, transport
+   * code, duration) plus a line per mount/rebuild/unload to
+   * `<DSH_HOME>/dsh-proxy.log` — the one place the desktop build's host log
+   * cannot be read from. The switch is volatile, so turning it on records the
+   * very next request without a restart.
+   */
+  debugLog: boolean
   /**
    * Effective stability settings after clamping (see `dsh-proxy/stability`).
    *
@@ -89,10 +98,11 @@ export interface HttpProxyConfig {
 /** Runtime schema for the plugin entry; also the settings page's form. */
 export const Config = z.object({
   proxy: z.string().default('').volatile(),
-  proxyHosts: z.array(z.string()).default([]).volatile(),
-  excludeHosts: z.array(z.string()).default([]).volatile(),
+  forceHosts: z.array(z.string()).default([]).volatile(),
   useSystemProxy: z.boolean().default(false).volatile(),
   proxySubprocesses: z.boolean().default(false).volatile(),
+  // The record file is opt-in: turn it on when a bad minute needs capturing.
+  debugLog: z.boolean().default(false).volatile(),
   // Stability knobs. They are volatile for the same reason the fields above
   // are: the settings page edits the live reference, the plugin rebuilds its
   // channels, and no restart is involved. The bounds live in
@@ -128,10 +138,10 @@ export function readConfig(config: PluginConfig, warn?: StabilityWarn): HttpProx
   const proxy = readRef(config.proxy)
   return {
     proxy: typeof proxy === 'string' ? proxy : '',
-    proxyHosts: hostList(readRef(config.proxyHosts)),
-    excludeHosts: hostList(readRef(config.excludeHosts)),
+    forceHosts: hostList(readRef(config.forceHosts)),
     useSystemProxy: readRef(config.useSystemProxy) === true,
     proxySubprocesses: readRef(config.proxySubprocesses) === true,
+    debugLog: readRef(config.debugLog) === true,
     stability: readStability({
       connectTimeoutMs: readRef(config.connectTimeoutMs),
       responseTimeoutMs: readRef(config.responseTimeoutMs),

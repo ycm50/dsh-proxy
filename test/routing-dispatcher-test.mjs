@@ -5,6 +5,7 @@
 // No network: both channels are fakes that record which one a request reached.
 import { getGlobalDispatcher, setGlobalDispatcher } from 'undici'
 import {
+  ChannelRotation,
   RoutingDispatcher,
   installGlobalDispatcher,
   isExemptHostname,
@@ -102,6 +103,57 @@ check('missing origin fails open', call('undefined-origin-holder'), 'direct')
 log.length = 0
 check('dispatch with no origin returns the channel result', routing.dispatch({}, {}), true)
 check('no origin goes direct', log[0], 'direct')
+
+// --- 3b. The dispatcher path moves the same cursor the wrapper does --------
+// Callers that captured `fetch` before this plugin mounted reach the network
+// through this dispatcher and never touch the wrapper, so the rotation has to be
+// driven from here too: an error moves the host to the other channel, response
+// headers keep it where it is. Without this the retries of those callers all
+// land on one channel — "four attempts, none of them connected".
+{
+  const seen = []
+  const outcomes = []
+  const rotation = new ChannelRotation()
+  const failing = {
+    dispatch(_options, handler) {
+      seen.push('direct')
+      handler?.onError?.(Object.assign(new Error('boom'), { code: 'ECONNREFUSED' }))
+      return true
+    },
+    close: async () => {}, destroy: async () => {},
+  }
+  const working = {
+    dispatch(_options, handler) {
+      seen.push('proxy')
+      handler?.onHeaders?.(200, [], () => {}, 'OK')
+      return true
+    },
+    close: async () => {}, destroy: async () => {},
+  }
+  const observed = new RoutingDispatcher({
+    direct: failing,
+    proxied: working,
+    proxyFor: (host) => rotation.channelFor(host) === 'proxy',
+    rotateFor: (host) => !isExemptHostname(host),
+    onOutcome: (record) => { rotation.record(record.hostname, record.ok); outcomes.push(record) },
+  })
+  const handler = { onConnect() {}, onHeaders() { return false }, onData() { return false }, onComplete() {}, onError() {} }
+  const call = () => observed.dispatch({ origin: 'https://api.example', path: '/v1/chat', method: 'POST' }, handler)
+  call()  // direct, fails -> the cursor moves to the proxy
+  call()  // proxy, answers -> the cursor moves on again
+  call()  // direct again
+  check('the dispatcher path alternates on every attempt', seen, ['direct', 'proxy', 'direct'])
+  check('the failure is recorded with its channel and code',
+    [outcomes[0].ok, outcomes[0].channel, outcomes[0].code], [false, 'direct', 'ECONNREFUSED'])
+  check('an answered dispatch is recorded as ok',
+    [outcomes[1].ok, outcomes[1].channel, typeof outcomes[1].ms], [true, 'proxy', 'number'])
+
+  // A loopback/LAN host has no cursor to move, so it is not observed at all.
+  seen.length = 0
+  observed.dispatch({ origin: 'http://127.0.0.1:9/x' }, handler)
+  check('an exempt host takes direct and is never observed',
+    [seen, rotation.stateOf('127.0.0.1') ?? '(none)'], [['direct'], '(none)'])
+}
 
 // --- 4. Teardown propagation -------------------------------------------------
 log.length = 0

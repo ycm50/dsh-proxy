@@ -74,6 +74,25 @@ export declare function isReplayableRequest(init: RequestInit | undefined): bool
  */
 export declare function isAborted(signal: AbortSignal | null | undefined): boolean;
 /**
+ * Sleep that a caller's abort can cut short, so Stop stays immediate.
+ *
+ * Exported because the routing layer runs the retry loop itself (it has to: each
+ * attempt takes a different channel), and that loop needs the same interruptible
+ * wait the single-channel retry uses.
+ * @param ms - how long to wait.
+ * @param signal - the caller's abort signal, if any.
+ * @returns a promise that settles when the wait ends or the caller aborts.
+ */
+export declare function abortableSleep(ms: number, signal: AbortSignal | null | undefined): Promise<void>;
+/**
+ * The backoff before one retry: the base doubled per attempt, jittered by up to
+ * a quarter either way so a fleet of clients does not retry in lockstep.
+ * @param baseDelayMs - the configured first delay.
+ * @param attempt - 1 for the first retry.
+ * @returns the delay in whole milliseconds.
+ */
+export declare function retryDelayMs(baseDelayMs: number, attempt: number): number;
+/**
  * Wrap a fetch so connection-level failures are re-dialled.
  *
  * The returned fetch resolves or rejects exactly like the one it wraps: once

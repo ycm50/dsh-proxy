@@ -30,16 +30,15 @@ export interface HttpProxyConfig {
      */
     proxy: string;
     /**
-     * Hostnames routed through the proxy, each an umbrella covering itself and
-     * its subdomains. This is the entire routed set: there is no auto-detected
-     * list behind it, so an empty array routes nothing at all.
+     * Hostnames pinned to the proxy: the only list there is.
+     *
+     * A host named here always travels through the proxy and never alternates
+     * channels. It is the answer for a site that is reachable directly but
+     * throttled hard enough that trying is pointless — a mirror that answers in
+     * 30 s direct and in 2 s through the proxy. Every other host starts direct and
+     * rotates to the proxy on its retries (see `dsh-proxy/routing`).
      */
-    proxyHosts: string[];
-    /**
-     * Hostnames that must never be routed. Judged before `proxyHosts`, so an
-     * entry here is direct even when the same host is also listed there.
-     */
-    excludeHosts: string[];
+    forceHosts: string[];
     /**
      * Whether to take the proxy address from the operating system instead of the
      * typed one. When set, the machine's own configuration is read for every
@@ -58,11 +57,21 @@ export interface HttpProxyConfig {
      * never injected; see {@link isValidSubprocessProxy}.
      *
      * It is independent of the host lists: it carries the same resolved address
-     * to the programs that cannot see the in-process routing, and an
-     * `excludeHosts` entry cannot carve out a child process, so the address a
+     * to the programs that cannot see the in-process routing, so the address a
      * child inherits is the one routing itself uses.
      */
     proxySubprocesses: boolean;
+    /**
+     * Whether the attempt record is appended to a file.
+     *
+     * Off by default: a diagnostic that writes files unasked is a surprise. On, it
+     * writes one line per attempt (channel, attempt number, outcome, transport
+     * code, duration) plus a line per mount/rebuild/unload to
+     * `<DSH_HOME>/dsh-proxy.log` — the one place the desktop build's host log
+     * cannot be read from. The switch is volatile, so turning it on records the
+     * very next request without a restart.
+     */
+    debugLog: boolean;
     /**
      * Effective stability settings after clamping (see `dsh-proxy/stability`).
      *
@@ -76,10 +85,10 @@ export interface HttpProxyConfig {
 /** Runtime schema for the plugin entry; also the settings page's form. */
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     proxy: z<string, string, "volatile-defined">;
-    proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
-    excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+    forceHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     useSystemProxy: z<boolean, boolean, "volatile-defined">;
     proxySubprocesses: z<boolean, boolean, "volatile-defined">;
+    debugLog: z<boolean, boolean, "volatile-defined">;
     connectTimeoutMs: z<number, number, "volatile-defined">;
     responseTimeoutMs: z<number, number, "volatile-defined">;
     streamIdleTimeoutMs: z<number, number, "volatile-defined">;
@@ -88,10 +97,10 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     retryOnPossibleDelivery: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     proxy: z<string, string, "volatile-defined">;
-    proxyHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
-    excludeHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
+    forceHosts: z<NoInfer<string[]>, NoInfer<string[]>, "volatile-defined">;
     useSystemProxy: z<boolean, boolean, "volatile-defined">;
     proxySubprocesses: z<boolean, boolean, "volatile-defined">;
+    debugLog: z<boolean, boolean, "volatile-defined">;
     connectTimeoutMs: z<number, number, "volatile-defined">;
     responseTimeoutMs: z<number, number, "volatile-defined">;
     streamIdleTimeoutMs: z<number, number, "volatile-defined">;

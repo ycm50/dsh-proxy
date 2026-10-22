@@ -1,21 +1,28 @@
 // Runtime smoke test for the ported host half: the volatile config contract,
-// default handling, readConfig unwrapping, umbrella host matching, exclusion
-// precedence, and URL validation.
+// default handling, readConfig unwrapping, umbrella host matching, the force
+// list, the built-in loopback/LAN exemption, and URL validation.
 import {
   Config,
   DEFAULT_STABILITY,
+  HAPPY_EYEBALLS_ATTEMPT_MS,
+  POOLED_IDLE_MAX_MS,
   POOLED_IDLE_WINDOW_MS,
+  STABILITY_BOUNDS,
   SUPPORTED_PROXY_SCHEMES,
   TCP_KEEPALIVE_DELAY_MS,
   agentOptionsOf,
   assertValid,
+  connectorOptionsOf,
+  describeRotation,
   describeStability,
+  headerPairs,
   isExemptHostname,
   matchesHostEntry,
+  normaliseFetchCall,
   normalizeHostEntry,
   readConfig,
   readStability,
-  shouldProxy,
+  shouldForceProxy,
   stabilityIsDefault,
 } from '../lib/index.js'
 
@@ -41,21 +48,31 @@ const setOf = (...entries) => {
 // --- 1. The volatile config contract ---------------------------------------
 const empty = Config({})
 check('empty proxy', readConfig(empty).proxy, '')
-check('empty proxyHosts', readConfig(empty).proxyHosts, [])
-check('empty excludeHosts', readConfig(empty).excludeHosts, [])
+check('empty forceHosts', readConfig(empty).forceHosts, [])
 check('fields are volatile references', typeof empty.proxy.get, 'function')
 check('useSystemProxy rests at false', readConfig(empty).useSystemProxy, false)
+check('proxySubprocesses rests at false', readConfig(empty).proxySubprocesses, false)
 
 const parsed = Config({
   proxy: 'socks5://127.0.0.1:7890',
-  proxyHosts: ['gateway.acme.example', '.aiplatform.googleapis.com'],
-  excludeHosts: ['api.deepseek.com'],
+  forceHosts: ['mirror.example', '.aiplatform.googleapis.com'],
 })
 check('proxy', readConfig(parsed).proxy, 'socks5://127.0.0.1:7890')
-check('proxyHosts', readConfig(parsed).proxyHosts, ['gateway.acme.example', '.aiplatform.googleapis.com'])
-check('excludeHosts', readConfig(parsed).excludeHosts, ['api.deepseek.com'])
+check('forceHosts', readConfig(parsed).forceHosts, ['mirror.example', '.aiplatform.googleapis.com'])
 check('a section without the switch reads as off', readConfig(parsed).useSystemProxy, false)
 check('the system-proxy switch is read back', readConfig(Config({ useSystemProxy: true })).useSystemProxy, true)
+check('the subprocess switch is read back', readConfig(Config({ proxySubprocesses: true })).proxySubprocesses, true)
+// The attempt record is a switch, not a default: a diagnostic that writes files
+// unasked is a surprise.
+check('the record switch ships off', readConfig(empty).debugLog, false)
+check('a section without the record switch reads as off', readConfig(parsed).debugLog, false)
+check('the record switch is read back', readConfig(Config({ debugLog: true })).debugLog, true)
+
+// A context that predates a field must read the default, never throw.
+const partial = readConfig({ proxy: { get: () => 'http://127.0.0.1:1' } })
+check('an absent force list reads empty', partial.forceHosts, [])
+check('an absent stability field reads its default', partial.stability.connectTimeoutMs, DEFAULT_STABILITY.connectTimeoutMs)
+check('readStability tolerates nothing at all', readStability(undefined).connectTimeoutMs, 60000)
 
 // --- 2. Entries are umbrellas: a domain covers its whole subtree ------------
 check('a plain domain normalizes to itself', normalizeHostEntry('commandcode.ai'), 'commandcode.ai')
@@ -63,61 +80,47 @@ check('a wildcard folds onto the same entry', normalizeHostEntry('*.commandcode.
 check('a dotted entry folds onto the same entry', normalizeHostEntry('.commandcode.ai'), '.commandcode.ai')
 check('a pasted URL keeps only its host', normalizeHostEntry('https://api.commandcode.ai/v1'), 'api.commandcode.ai')
 check('host:port drops the port', normalizeHostEntry('gateway.acme.example:8443'), 'gateway.acme.example')
+check('an empty entry is nothing', normalizeHostEntry('   '), undefined)
 
 const saved = setOf('commandcode.ai') // exactly what is saved in the profile
-check('the umbrella itself matches', shouldProxy('https://commandcode.ai/', saved), true)
-check('a one-level child matches', shouldProxy('https://api.commandcode.ai/provider/v1', saved), true)
-check('a child matches at any depth', shouldProxy('https://a.b.c.d.commandcode.ai/', saved), true)
-check('a hyphen sibling matches (region hosts)', shouldProxy('https://eu-commandcode.ai/', saved), true)
-check('an unrelated domain does not match', shouldProxy('https://api.deepseek.com/v1', saved), false)
-check('a lookalike suffix does not match', shouldProxy('https://notcommandcode.ai/', saved), false)
+check('the umbrella itself matches', [...saved].some((entry) => matchesHostEntry('commandcode.ai', entry)), true)
+check('a one-level child matches', [...saved].some((entry) => matchesHostEntry('api.commandcode.ai', entry)), true)
+check('a child matches at any depth', [...saved].some((entry) => matchesHostEntry('a.b.c.d.commandcode.ai', entry)), true)
+check('a hyphen sibling matches (region hosts)', [...saved].some((entry) => matchesHostEntry('eu-commandcode.ai', entry)), true)
+check('an unrelated domain does not match', [...saved].some((entry) => matchesHostEntry('api.deepseek.com', entry)), false)
+check('a lookalike suffix does not match', [...saved].some((entry) => matchesHostEntry('notcommandcode.ai', entry)), false)
 
 // The three spellings of one umbrella are interchangeable.
 for (const [label, set] of [['dotted', setOf('.commandcode.ai')], ['wildcard', setOf('*.commandcode.ai')]]) {
-  check(`${label} spelling reaches the same child`, shouldProxy('https://api.commandcode.ai/v1', set), true)
-  check(`${label} spelling reaches deep children`, shouldProxy('https://x.y.commandcode.ai/', set), true)
+  check(`${label} spelling reaches the same child`, [...set].some((entry) => matchesHostEntry('api.commandcode.ai', entry)), true)
+  check(`${label} spelling reaches deep children`, [...set].some((entry) => matchesHostEntry('x.y.commandcode.ai', entry)), true)
 }
 
 // Vertex/Azure region endpoints: the umbrella reaches the hyphen sibling.
 const vertex = setOf('aiplatform.googleapis.com')
-check('vertex region host via a plain umbrella', shouldProxy('https://us-central1-aiplatform.googleapis.com/v1', vertex), true)
-check('vertex bare domain matches too', shouldProxy('https://aiplatform.googleapis.com/', vertex), true)
+check('vertex region host via a plain umbrella', shouldForceProxy('us-central1-aiplatform.googleapis.com', vertex), true)
+check('vertex bare domain matches too', shouldForceProxy('aiplatform.googleapis.com', vertex), true)
 
-// --- 3. Exclusions win, with the same umbrella semantics --------------------
-const routed = setOf('commandcode.ai', 'api.deepseek.com')
-check('baseline: the child is routed', shouldProxy('https://api.commandcode.ai/v1', routed), true)
-check(
-  'excluding the umbrella keeps the whole subtree direct',
-  shouldProxy('https://api.commandcode.ai/v1', routed, setOf('commandcode.ai')),
-  false,
-)
-check(
-  'excluding one child carves only that child back out',
-  shouldProxy('https://api.commandcode.ai/v1', routed, setOf('api.commandcode.ai')),
-  false,
-)
-check(
-  'excluding one child leaves its siblings routed',
-  shouldProxy('https://other.commandcode.ai/v1', routed, setOf('api.commandcode.ai')),
-  true,
-)
-check(
-  'excluding a plain domain reaches an exact auto-mode host (the old bug)',
-  shouldProxy('https://api.deepseek.com/v1', routed, setOf('deepseek.com')),
-  false,
-)
-check(
-  'an exclusion that matches nothing changes nothing',
-  shouldProxy('https://api.commandcode.ai/v1', routed, setOf('example.org')),
-  true,
-)
-check(
-  'exclusions apply in explicit mode too',
-  shouldProxy('https://a.b.commandcode.ai/', saved, setOf('.commandcode.ai')),
-  false,
-)
+// --- 3. The force list is the only list, and it is an umbrella -------------
+const forced = setOf('mirror.example')
+check('the pinned umbrella itself is pinned', shouldForceProxy('mirror.example', forced), true)
+check('a one-level child is pinned', shouldForceProxy('api.mirror.example', forced), true)
+check('a deep child is pinned', shouldForceProxy('a.b.mirror.example', forced), true)
+check('a hyphen sibling is pinned', shouldForceProxy('eu-mirror.example', forced), true)
+check('an unrelated host is not pinned', shouldForceProxy('other.example', forced), false)
+check('a lookalike is not pinned', shouldForceProxy('notmirror.example', forced), false)
+check('an empty force list pins nothing', shouldForceProxy('api.mirror.example', new Set()), false)
 
-// --- 4. URL validation -----------------------------------------------------
+// --- 4. Loopback and private networks outrank every list -------------------
+for (const host of ['127.0.0.1', 'localhost', '::1', '10.1.2.3', '192.168.1.9', '172.20.0.1', '169.254.1.1', '100.64.0.1', 'fd00::1', 'fe80::1', 'nas.local']) {
+  check('a private host is never pinned: ' + host, shouldForceProxy(host, setOf(host)), false)
+  check('a private host is exempt: ' + host, isExemptHostname(host), true)
+}
+check('a public host in the same list is still pinned', shouldForceProxy('mirror.example', setOf('mirror.example', '10.0.0.1')), true)
+check('a lookalike of loopback is not exempt', isExemptHostname('127.0.0.1.evil.example'), false)
+check('a public host is not exempt', isExemptHostname('api.opencode.ai'), false)
+
+// --- 5. URL validation -----------------------------------------------------
 for (const scheme of SUPPORTED_PROXY_SCHEMES) {
   let thrown
   try { assertValid({ proxy: `${scheme}://127.0.0.1:1080` }) } catch (error) { thrown = error }
@@ -130,39 +133,6 @@ let malformed
 try { assertValid({ proxy: 'not a url' }) } catch (error) { malformed = error.message }
 check('assertValid rejects a malformed URL', typeof malformed, 'string')
 check('assertValid accepts an empty proxy', assertValid({ proxy: '' }), undefined)
-
-// --- 4b. The routing contract, stated as the settings page states it -------
-// The list is the whole policy: listed hosts and their subdomains are routed,
-// nothing else is, and an exclusion outranks the list entirely. These are the
-// rules the page's copy promises, so they are asserted here against the same
-// function the wrapper uses.
-const contract = setOf('proxy.example')
-check('a listed host is routed', shouldProxy('https://proxy.example/x', contract), true)
-check('a subdomain of a listed host is routed', shouldProxy('https://api.proxy.example/x', contract), true)
-check('a deep subdomain is routed', shouldProxy('https://a.b.proxy.example/x', contract), true)
-check('an unlisted host stays direct', shouldProxy('https://other.example/x', contract), false)
-check('a lookalike host stays direct', shouldProxy('https://xproxy.example/x', contract), false)
-
-// An empty list routes nothing: there is no auto-detected set behind it.
-check('an empty list routes nothing', shouldProxy('https://api.deepseek.com/x', new Set()), false)
-check('an empty list routes nothing even for a model host', shouldProxy('https://any.example/x', new Set()), false)
-
-// An exclusion is the highest-priority input there is.
-check('an exclusion outranks the list', shouldProxy('https://proxy.example/x', contract, setOf('proxy.example')), false)
-check('an exclusion outranks the list for a child', shouldProxy('https://api.proxy.example/x', contract, setOf('proxy.example')), false)
-check('an exclusion of one child leaves its sibling routed', shouldProxy('https://api.proxy.example/x', contract, setOf('other.proxy.example')), true)
-
-// Loopback is direct without the list being consulted at all.
-check('loopback stays direct even when listed', shouldProxy('http://127.0.0.1:9/x', setOf('127.0.0.1')), false)
-check('localhost stays direct even when listed', shouldProxy('http://localhost:9/x', setOf('localhost')), false)
-check('loopback is not matched as a suffix', shouldProxy('https://127.0.0.1.evil.example/x', contract), false)
-
-// An unparseable URL has no hostname to judge, so it never travels.
-check('an unparseable URL is never routed', shouldProxy('notaurl', contract), false)
-
-// --- 5. The matching helper is exported for the browser half ---------------
-check('matchesHostEntry is usable directly', matchesHostEntry('api.a.b', 'a.b'), true)
-check('matchesHostEntry rejects a non-child', matchesHostEntry('xay.b', 'a.b'), false)
 
 // --- 6. The stability contract ---------------------------------------------
 // These knobs are what the request path is built from, so their defaults,
@@ -186,34 +156,67 @@ check('a tuned snapshot is not stock', stabilityIsDefault(tuned.stability), fals
 
 const repaired = []
 const clamped = readConfig(Config({ connectTimeoutMs: 10, responseTimeoutMs: 99999999 }), (message) => repaired.push(message))
-check('a too-small connect timeout clamps up', clamped.stability.connectTimeoutMs, 1000)
-check('a too-large response timeout clamps down', clamped.stability.responseTimeoutMs, 3600000)
+check('a too-small connect timeout clamps up', clamped.stability.connectTimeoutMs, STABILITY_BOUNDS.connectTimeoutMs.min)
+check('a too-large response timeout clamps down', clamped.stability.responseTimeoutMs, STABILITY_BOUNDS.responseTimeoutMs.max)
 check('each repair is reported', repaired.length, 2)
-
-// A context that predates a field must read the default, never throw.
-const partial = readConfig({ proxy: { get: () => 'http://127.0.0.1:1' }, proxyHosts: { get: () => [] } })
-check('an absent stability field reads its default', partial.stability.connectTimeoutMs, DEFAULT_STABILITY.connectTimeoutMs)
-check('an absent proxy list reads empty', partial.proxyHosts, [])
-check('readStability tolerates nothing at all', readStability(undefined).connectTimeoutMs, 60000)
 
 const options = agentOptionsOf(stock.stability)
 check('the connect ceiling reaches the agent', options.connectTimeout, 60000)
 check('the CONNECT tunnel shares that ceiling', options.connect.timeout, 60000)
 check('TCP keepalive is on', options.connect.keepAlive, true)
 check('keepalive probes start at 30s', options.connect.keepAliveInitialDelay, TCP_KEEPALIVE_DELAY_MS)
-check('the pooled idle window is bounded', options.keepAliveMaxTimeout, POOLED_IDLE_WINDOW_MS)
+// The pooled idle window is what keeps one conversation on one tunnel: a fresh
+// proxied tunnel was measured at 1.3-1.6 s, and the chat cadence is a turn every
+// 10-60 s, so anything near undici's 4 s default re-dials every message.
+check('a conversation keeps its tunnel', options.keepAliveTimeout, POOLED_IDLE_WINDOW_MS)
+check('the pool window is long enough to span a turn', POOLED_IDLE_WINDOW_MS >= 60000, true)
+check('the negotiated window cannot pull it back down', options.keepAliveMaxTimeout, POOLED_IDLE_MAX_MS)
+check('the negotiated window stays at or above the idle one', options.keepAliveMaxTimeout >= options.keepAliveTimeout, true)
 check('a zero stream window disables the watchdog', options.bodyTimeout, 0)
 check('autoSelectFamily is on', options.connect.autoSelectFamily, true)
+check('happy eyeballs uses the platform attempt window', options.connect.autoSelectFamilyAttemptTimeout, HAPPY_EYEBALLS_ATTEMPT_MS)
 check('undici is not allowed to wait out a hung handshake', options.connectTimeout > 10000, true)
+// One connector shape for every socket: ProxyAgent reads only proxyTls /
+// requestTls, so the direct dial and the tunnel must not drift apart.
+check('the tunnel and the direct dial share one connector shape', connectorOptionsOf(stock.stability), options.connect)
 check('describeStability summarises the budget', describeStability(stock.stability), 'connect=60s headers=300s body=off retry=3x400ms')
 check('describeStability flags safe-only retries', describeStability({ ...stock.stability, retryOnPossibleDelivery: false }), 'connect=60s headers=300s body=off retry=3x400ms retry-safe-only')
 
-// --- 6b. Private networks never travel --------------------------------------
-for (const host of ['10.1.2.3', '192.168.1.9', '172.20.0.1', '169.254.1.1', '100.64.0.1', 'fd00::1', 'fe80::1', 'nas.local']) {
-  check('a private host stays direct when listed: ' + host, shouldProxy('http://' + host + '/x', setOf(host)), false)
+// --- 7. A Request from the platform is not the bundled undici's Request -----
+// The plugin bundles its own undici, so a Request built by Node's own fetch is a
+// *different class*. Passing it straight through made undici stringify it to
+// "[object Request]" and reject with ERR_INVALID_URL — instantly, before any
+// socket, on every attempt and on both channels. It is taken apart instead.
+{
+  const request = new Request('https://a.example/v1/chat', {
+    method: 'POST',
+    headers: { 'x-a': '1' },
+    body: '{"hi":1}',
+  })
+  const call = await normaliseFetchCall(request, { headers: { 'x-b': '2' } })
+  const headers = Object.fromEntries(call.init.headers)
+  check('a foreign request becomes its URL', call.input, 'https://a.example/v1/chat')
+  check('its method is carried over', call.init.method, 'POST')
+  check('its body is read back out', call.init.body, '{"hi":1}')
+  check('both header sources survive, init last', [headers['x-a'], headers['x-b']], ['1', '2'])
 }
-check('a public host in the same list still routes', shouldProxy('https://proxy.example/x', setOf('proxy.example', '10.0.0.1')), true)
-check('isExemptHostname covers loopback too', isExemptHostname('127.0.0.1'), true)
+{
+  const call = await normaliseFetchCall('https://a.example/x', { headers: { 'x-a': '1' } })
+  check('a string input stays a string', call.input, 'https://a.example/x')
+  check('its init headers become pairs', call.init.headers, [['x-a', '1']])
+}
+check('headerPairs reads a record', headerPairs({ a: '1', b: 2 }), [['a', '1'], ['b', '2']])
+check('headerPairs reads an array', headerPairs([['a', '1']]), [['a', '1']])
+check('headerPairs reads a Headers instance', headerPairs(new Headers({ a: '1' })), [['a', '1']])
+check('headerPairs has nothing for an absent list', headerPairs(undefined), undefined)
+
+// --- 8. The shipped strategy is the rotation, not a set of knobs -----------
+// The retry budget is the only thing that decides how many attempts a request
+// gets, and the rotation alternates them; the mount log says so.
+check('describeRotation names the shipped strategy',
+  describeRotation(1 + stock.stability.retryCount),
+  'route=rotate (attempt 1 direct, the other channel every attempt after it, up to 4 attempts)')
+check('the retry budget is the attempt budget', describeRotation(1), 'route=rotate (attempt 1 direct, the other channel every attempt after it, up to 1 attempt)')
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)

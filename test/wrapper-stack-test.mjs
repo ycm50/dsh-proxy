@@ -51,8 +51,6 @@ function newHost() {
 /** The settings row's live fields. */
 const config = (value) => ({
   proxy: { get: () => value.proxy },
-  proxyHosts: { get: () => value.proxyHosts },
-  excludeHosts: { get: () => value.excludeHosts },
   useSystemProxy: { get: () => value.useSystemProxy },
   proxySubprocesses: { get: () => value.proxySubprocesses },
   // Stability refs, present for the same reason the Loader always supplies
@@ -74,7 +72,7 @@ function newProfile() {
 }
 
 const base = {
-  proxy: 'http://127.0.0.1:10808', proxyHosts: ['listed.example'], excludeHosts: [],
+  proxy: 'http://127.0.0.1:10808', forceHosts: ['listed.example'],
   useSystemProxy: false, proxySubprocesses: false,
 }
 

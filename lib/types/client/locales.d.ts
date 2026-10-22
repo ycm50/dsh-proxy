@@ -17,6 +17,8 @@ export declare const en: {
     useSystemProxyHint: string;
     proxySubprocesses: string;
     proxySubprocessesHint: string;
+    debugLog: string;
+    debugLogHint: string;
     systemProxyReading: string;
     systemProxyDetected: string;
     systemProxyNone: string;
@@ -28,10 +30,12 @@ export declare const en: {
     systemProxyFromMacos: string;
     systemProxyFromLinux: string;
     systemProxyFromNone: string;
-    hosts: string;
-    hostsHint: string;
-    exclude: string;
-    excludeHint: string;
+    connection: string;
+    connectionHint: string;
+    domains: string;
+    domainsHint: string;
+    force: string;
+    forceHint: string;
     stability: string;
     stabilityHint: string;
     connectTimeoutMs: string;

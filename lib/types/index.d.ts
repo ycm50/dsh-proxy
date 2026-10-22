@@ -15,12 +15,16 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { PluginConfig } from './config.js';
 export { Config, SUBPROCESS_PROXY_SCHEMES, assertValid, isValidSubprocessProxy, readConfig, SUPPORTED_PROXY_SCHEMES } from './config.js';
 export type { HttpProxyConfig, PluginConfig } from './config.js';
-export { createHardenedChannel, createProxyFetch, createRoutingFetch, hostnameOf, isLanHostname, isLoopbackHostname, matchesHostEntry, normalizeHostEntry, shouldProxy, shouldProxyHostname, urlOf, } from './proxy.js';
-export type { ChannelOptions, HardenedChannel, ProxyFetch } from './proxy.js';
+export { createHardenedChannel, createProxyFetch, createRoutingFetch, headerPairs, hostnameOf, isLanHostname, isLoopbackHostname, matchesHostEntry, normaliseFetchCall, normalizeHostEntry, shouldForceProxy, urlOf, } from './proxy.js';
+export type { ChannelOptions, HardenedChannel, NormalisedCall, ProxyFetch, RoutingOptions } from './proxy.js';
 export { RoutingDispatcher, installGlobalDispatcher, isExemptHostname, liveDispatcherCount, uninstallGlobalDispatcher, } from './dispatch.js';
 export type { RoutingInput } from './dispatch.js';
-export { DEFAULT_STABILITY, POOLED_IDLE_WINDOW_MS, STABILITY_BOUNDS, STABILITY_FIELDS, TCP_KEEPALIVE_DELAY_MS, agentOptionsOf, describeStability, readStability, stabilityIsDefault, } from './stability.js';
-export type { HardenedAgentOptions, StabilityConfig, StabilityField } from './stability.js';
+export { DEFAULT_STABILITY, HAPPY_EYEBALLS_ATTEMPT_MS, POOLED_IDLE_MAX_MS, POOLED_IDLE_WINDOW_MS, STABILITY_BOUNDS, STABILITY_FIELDS, TCP_KEEPALIVE_DELAY_MS, agentOptionsOf, connectorOptionsOf, describeStability, readStability, stabilityIsDefault, } from './stability.js';
+export type { HardenedAgentOptions, HardenedConnectOptions, StabilityConfig, StabilityField } from './stability.js';
+export { ProxyObserver, observerFromEnv } from './observe.js';
+export type { ObservedChannel, ObserverOptions, ObserverStats, ObserverSummary, RequestSample, } from './observe.js';
+export { ChannelRotation, FIRST_CHANNEL, describeRotation, otherChannel, } from './routing.js';
+export type { RouteAttempt, RouteChannel } from './routing.js';
 export { isAborted, isReplayableRequest, isRetryableTransportError, transportCodeOf, withTransportRetry, } from './retry.js';
 export type { RetryAttempt, RetryPolicy } from './retry.js';
 export { PROXY_ENV_NAMES, WINDOWS_INTERNET_SETTINGS_KEY, normalizeProxyValue, parseGsettingsValue, parseScutilProxy, parseWindowsProxyServer, parseWindowsRegistry, pickWindowsProxy, readEnvironmentProxy, readMacSystemProxy, readSystemProxy, readWindowsSystemProxy, } from './system-proxy.js';
@@ -32,6 +36,8 @@ export { PROFILE_MANIFEST_FILE, PROFILE_PATCH_FILE, PROXY_ENTRY_ID, PROXY_IDENTI
 export type { BundleSelection, PatchPruneResult, PatchStripResult, ProxyIdentity, ProxyRowCleanup, ProxyRowState, } from './profile-patch.js';
 /** Plugin short name (also the profile entry id that carries its settings). */
 export declare const name = "dsh-proxy";
+/** Where the record file lives when the environment does not name one. */
+export declare function defaultRecordPath(env?: NodeJS.ProcessEnv): string;
 /**
  * Install the two interception layers — the process-wide dispatcher and the
  * routing `fetch` — plus the Connection channel that lets the settings page

@@ -29,6 +29,18 @@ export interface HttpProxySettings {
     useSystemProxy?: boolean;
     /** Whether child processes (plugin install/update) inherit the proxy. */
     proxySubprocesses?: boolean;
+    /** Ceiling for a TCP connect and for a proxy CONNECT tunnel, in milliseconds. */
+    connectTimeoutMs?: number;
+    /** Ceiling for waiting on response headers; 0 disables the watchdog. */
+    responseTimeoutMs?: number;
+    /** Ceiling for the gap between streaming body chunks; 0 disables it. */
+    streamIdleTimeoutMs?: number;
+    /** Transport-level retries for connection failures (0 turns them off). */
+    retryCount?: number;
+    /** First backoff delay for a transport retry. */
+    retryDelayMs?: number;
+    /** Whether a reset that may have arrived after delivery is retried too. */
+    retryOnPossibleDelivery?: boolean;
 }
 /** The `llm-pi-ai` section subset this page reads for known model gateways. */
 export interface PiAiSettings {
@@ -38,8 +50,18 @@ export interface PiAiSettings {
 }
 /** The two host-list fields, which share one control shape. */
 export type HostFieldName = 'proxyHosts' | 'excludeHosts';
+/** The staged on/off switches of the stability group, and the subprocess one. */
+export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'retryOnPossibleDelivery';
+/**
+ * The numeric fields of the stability group.
+ *
+ * They are staged as text like every other field, so the draft is what the user
+ * typed and the Host schema stays the only judge of what is acceptable; the
+ * page shows its verdict as the field's invalid state.
+ */
+export type NumberFieldName = 'connectTimeoutMs' | 'responseTimeoutMs' | 'streamIdleTimeoutMs' | 'retryCount' | 'retryDelayMs';
 /** One editable field of the page. */
-export type FieldName = 'proxy' | HostFieldName | 'useSystemProxy' | 'proxySubprocesses';
+export type FieldName = 'proxy' | HostFieldName | BooleanFieldName | NumberFieldName;
 /** What the dsh-proxy settings page renders. */
 export interface HttpProxyFormState extends SettingsFormShell {
     /** Staged proxy URL. */
@@ -53,6 +75,18 @@ export interface HttpProxyFormState extends SettingsFormShell {
     /** Staged "route every request through the proxy" switch. */
     /** Staged "child processes inherit the proxy" switch. */
     proxySubprocesses: SettingsFieldState;
+    /** Staged connect ceiling, in milliseconds. */
+    connectTimeoutMs: SettingsFieldState;
+    /** Staged response-header ceiling, in milliseconds. */
+    responseTimeoutMs: SettingsFieldState;
+    /** Staged streaming idle ceiling, in milliseconds. */
+    streamIdleTimeoutMs: SettingsFieldState;
+    /** Staged connection retry budget. */
+    retryCount: SettingsFieldState;
+    /** Staged first backoff delay, in milliseconds. */
+    retryDelayMs: SettingsFieldState;
+    /** Staged "retry a possibly-delivered failure too" switch. */
+    retryOnPossibleDelivery: SettingsFieldState;
     /** Known model hostnames offered beside the host fields (free text still allowed). */
     suggestions: string[];
 }

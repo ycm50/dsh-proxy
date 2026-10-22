@@ -68,4 +68,17 @@ export declare function matchesHostEntry(hostname: string, entry: string): boole
  * @returns the non-empty entries, in order.
  */
 export declare function splitHostEntries(text: string): string[];
+/**
+ * Whether a hostname names a private/local network rather than the public
+ * internet. Pure string comparison, never DNS — the decision must not depend
+ * on the network being reachable (see \`isLoopbackHostname\` for the same rule).
+ *
+ * Covered: \`10/8\`, \`172.16/12\`, \`192.168/16\`, \`169.254/16\`, \`100.64/10\`,
+ * \`0/8\`; IPv6 unique-local \`fc00::/7\` and link-local \`fe80::/10\` (including the
+ * IPv4-mapped spellings Node's \`URL\` may hand over); and the local suffixes
+ * above.
+ * @param hostname - a URL hostname, bracketed or not, in any case.
+ * @returns whether the host is a private/local address.
+ */
+export declare function isLanHostname(hostname: string): boolean;
 //# sourceMappingURL=hosts.d.ts.map

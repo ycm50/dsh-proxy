@@ -55,6 +55,14 @@ const config = (value) => ({
   excludeHosts: { get: () => value.excludeHosts },
   useSystemProxy: { get: () => value.useSystemProxy },
   proxySubprocesses: { get: () => value.proxySubprocesses },
+  // Stability refs, present for the same reason the Loader always supplies
+  // them: the request path reads every one of them on each refresh.
+  connectTimeoutMs: { get: () => value.connectTimeoutMs ?? 60000 },
+  responseTimeoutMs: { get: () => value.responseTimeoutMs ?? 300000 },
+  streamIdleTimeoutMs: { get: () => value.streamIdleTimeoutMs ?? 0 },
+  retryCount: { get: () => value.retryCount ?? 3 },
+  retryDelayMs: { get: () => value.retryDelayMs ?? 400 },
+  retryOnPossibleDelivery: { get: () => value.retryOnPossibleDelivery ?? true },
 })
 
 /** A temporary profile selecting this plugin's own bundle. */

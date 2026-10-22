@@ -3,12 +3,20 @@
 // precedence, and URL validation.
 import {
   Config,
+  DEFAULT_STABILITY,
+  POOLED_IDLE_WINDOW_MS,
   SUPPORTED_PROXY_SCHEMES,
+  TCP_KEEPALIVE_DELAY_MS,
+  agentOptionsOf,
   assertValid,
+  describeStability,
+  isExemptHostname,
   matchesHostEntry,
   normalizeHostEntry,
   readConfig,
+  readStability,
   shouldProxy,
+  stabilityIsDefault,
 } from '../lib/index.js'
 
 let failures = 0
@@ -155,6 +163,57 @@ check('an unparseable URL is never routed', shouldProxy('notaurl', contract), fa
 // --- 5. The matching helper is exported for the browser half ---------------
 check('matchesHostEntry is usable directly', matchesHostEntry('api.a.b', 'a.b'), true)
 check('matchesHostEntry rejects a non-child', matchesHostEntry('xay.b', 'a.b'), false)
+
+// --- 6. The stability contract ---------------------------------------------
+// These knobs are what the request path is built from, so their defaults,
+// clamping, and translation into agent options are asserted rather than
+// trusted. The failures measured on this machine — a 10.5 s CONNECT through
+// the local proxy, and a 10.373 s direct connect that spent 0.0 ms of CPU —
+// are exactly what the shipped defaults exist to clear.
+const stock = readConfig(Config({}))
+check('connect timeout ships at 60s', stock.stability.connectTimeoutMs, DEFAULT_STABILITY.connectTimeoutMs)
+check('response timeout ships at 5m', stock.stability.responseTimeoutMs, 300000)
+check('the stream watchdog ships off', stock.stability.streamIdleTimeoutMs, 0)
+check('the retry budget ships at 3x400ms', [stock.stability.retryCount, stock.stability.retryDelayMs], [3, 400])
+check('possible-delivery retries ship on', stock.stability.retryOnPossibleDelivery, true)
+check('the shipped snapshot reads as stock', stabilityIsDefault(stock.stability), true)
+
+const tuned = readConfig(Config({ connectTimeoutMs: 120000, retryCount: 0, streamIdleTimeoutMs: 45000 }))
+check('a stored connect timeout is honoured', tuned.stability.connectTimeoutMs, 120000)
+check('retries can be switched off', tuned.stability.retryCount, 0)
+check('a stored stream window is honoured', tuned.stability.streamIdleTimeoutMs, 45000)
+check('a tuned snapshot is not stock', stabilityIsDefault(tuned.stability), false)
+
+const repaired = []
+const clamped = readConfig(Config({ connectTimeoutMs: 10, responseTimeoutMs: 99999999 }), (message) => repaired.push(message))
+check('a too-small connect timeout clamps up', clamped.stability.connectTimeoutMs, 1000)
+check('a too-large response timeout clamps down', clamped.stability.responseTimeoutMs, 3600000)
+check('each repair is reported', repaired.length, 2)
+
+// A context that predates a field must read the default, never throw.
+const partial = readConfig({ proxy: { get: () => 'http://127.0.0.1:1' }, proxyHosts: { get: () => [] } })
+check('an absent stability field reads its default', partial.stability.connectTimeoutMs, DEFAULT_STABILITY.connectTimeoutMs)
+check('an absent proxy list reads empty', partial.proxyHosts, [])
+check('readStability tolerates nothing at all', readStability(undefined).connectTimeoutMs, 60000)
+
+const options = agentOptionsOf(stock.stability)
+check('the connect ceiling reaches the agent', options.connectTimeout, 60000)
+check('the CONNECT tunnel shares that ceiling', options.connect.timeout, 60000)
+check('TCP keepalive is on', options.connect.keepAlive, true)
+check('keepalive probes start at 30s', options.connect.keepAliveInitialDelay, TCP_KEEPALIVE_DELAY_MS)
+check('the pooled idle window is bounded', options.keepAliveMaxTimeout, POOLED_IDLE_WINDOW_MS)
+check('a zero stream window disables the watchdog', options.bodyTimeout, 0)
+check('autoSelectFamily is on', options.connect.autoSelectFamily, true)
+check('undici is not allowed to wait out a hung handshake', options.connectTimeout > 10000, true)
+check('describeStability summarises the budget', describeStability(stock.stability), 'connect=60s headers=300s body=off retry=3x400ms')
+check('describeStability flags safe-only retries', describeStability({ ...stock.stability, retryOnPossibleDelivery: false }), 'connect=60s headers=300s body=off retry=3x400ms retry-safe-only')
+
+// --- 6b. Private networks never travel --------------------------------------
+for (const host of ['10.1.2.3', '192.168.1.9', '172.20.0.1', '169.254.1.1', '100.64.0.1', 'fd00::1', 'fe80::1', 'nas.local']) {
+  check('a private host stays direct when listed: ' + host, shouldProxy('http://' + host + '/x', setOf(host)), false)
+}
+check('a public host in the same list still routes', shouldProxy('https://proxy.example/x', setOf('proxy.example', '10.0.0.1')), true)
+check('isExemptHostname covers loopback too', isExemptHostname('127.0.0.1'), true)
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)

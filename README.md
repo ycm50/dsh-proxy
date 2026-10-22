@@ -1,13 +1,14 @@
 # dsh-proxy
 
-给 DeepSeek Harness（DSH）加代理能力，**不改任何 DSH 官方代码**。**只有「只代理这些域名」里列出的域名及其子域名走代理，其余请求一律直连**；「排除域名」优先级最高，命中的域名永远直连。打开「插件安装/更新也走代理」还能让 pnpm / git 这类子进程也走代理。代理地址可以手填，也可以在设置页勾一下「使用系统代理」，直接读本机（Windows / macOS / Linux）的代理设置。
+给 DeepSeek Harness（DSH）加代理能力，**不改任何 DSH 官方代码**。**只有「只代理这些域名」里列出的域名及其子域名走代理；其余请求同样由本插件发出，走插件自己的加固直连通道**——这一点是刻意的：未列出的域名不再回落到 DSH 官方默认栈，因此一样享有长建连上限、TCP keepalive 与连接级重试。「排除域名」优先级最高，命中的域名永远直连；**回环与内网/LAN 段是内置豁免，任何配置都改不动**。打开「插件安装/更新也走代理」还能让 pnpm / git 这类子进程也走代理。代理地址可以手填，也可以在设置页勾一下「使用系统代理」，直接读本机（Windows / macOS / Linux）的代理设置。
 
-实现方式是在 host 进程的 `globalThis.fetch` 上包一层：命中域名集合的请求走代理，其它（web 搜索、网页抓取、MCP…）照旧直连。卸载即完全恢复原状——profile 里那一行设置也会被插件自己收回（见「清空即自清理」）。
+实现方式有两层：host 进程里装一个**进程级 undici dispatcher**（按 hostname 分流；覆盖那些早就捕获了 `fetch`、或直接用 undici API 的调用方），再包一层 `globalThis.fetch`（覆盖自带 dispatcher 的调用方）。两条通道——代理通道与直连通道——都由插件自己构建，共用同一套加固选项：建连上限、TCP keepalive、受限的连接池空闲窗口、连接级重试。卸载即完全恢复原状：dispatcher 与 `fetch` 都还原成安装前的那一个，连接池优雅关闭（不打断在途请求），profile 里那一行设置也会被插件自己收回（见「清空即自清理」）。
 
 ## 兼容性
 
 | 插件版本 | 需要的 DSH |
 | --- | --- |
+| **0.5.x** | **≥ 0.2.0-rc.1**（接管扩到进程级 undici dispatcher；两条通道加固；未列出的域名不再回落官方栈；新增「请求稳定性」参数；回环与内网段豁免） |
 | **0.4.x** | **≥ 0.1.7-rc.2**（新增「使用系统代理」；读取走 Connection 的 `/api` 精确路由，已在 DSH 0.2.0-rc.1 上实测） |
 | 0.3.x | ≥ 0.1.7-rc.2（包名 / entry id 均为 `dsh-proxy`） |
 | 0.2.x | ≥ 0.1.7-rc.2（包名 / entry id 为 `dsh-http-proxy` / `http-proxy`） |
@@ -50,7 +51,13 @@ dsh plugin --profile <profile名> add dsh-proxy@file:/绝对路径/dsh-proxy-0.3
 | 使用系统代理 | 勾选后**立即**读取本机代理设置并填入「代理地址」；勾选期间优先使用系统代理（见下） |
 | 插件安装/更新也走代理 | 默认关闭。打开后把代理写进**子进程环境变量**，让 `dsh plugin` 调用 pnpm / git 安装或更新插件时也走代理；子进程看不到上面两个域名名单，**仅在「代理地址」是 http/https 时生效**（见「限制」） |
 | 只代理这些域名 | **走代理的完整名单**：列出的域名及其子域名走代理，其余一律直连。**留空 = 一个都不代理**（没有自动识别）。逗号分隔，支持域名 / 域名:端口 / URL / `.域名` 后缀 |
-| 排除域名 | **优先级最高**：命中的域名永远直连，比上一项先判定——即使同一个域名两边都写了，结果也是直连。回环地址（`localhost` / `127.0.0.1` / `::1`）**始终直连**，由插件保证，不依赖配置 |
+| 排除域名 | **优先级最高**：命中的域名永远直连，比上一项先判定——即使同一个域名两边都写了，结果也是直连。回环地址（`localhost` / `127.0.0.1` / `::1` / 整个 `127.0.0.0/8`）与内网段（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、IPv6 `fc00::/7` 与 `fe80::/10`、以及 `.local` / `.lan` / `.internal` / `.home.arpa`）**始终直连**，由插件保证，不依赖配置 |
+| 建连超时（毫秒） | 默认 `60000`。TCP 建连与代理 CONNECT 隧道建立的上限。**别低于 30000**：本机实测代理握手最慢 10.5 秒，旧版沿用的 undici 默认 10 秒会把它变成 `UND_ERR_CONNECT_TIMEOUT` |
+| 等待响应头超时（毫秒） | 默认 `300000`，`0` = 不限制 |
+| 流空闲超时（毫秒） | 默认 `0`（不限制）：流式传输中两个分片之间的间隔不设上限，慢模型不会被本插件掐断（DSH 自己另有流看门狗） |
+| 连接重试次数 | 默认 `3`，`0` = 关闭。只重试**连接级**失败，且仅当请求体可重放；指数退避 + 抖动，可用「停止」立刻打断 |
+| 重试退避基数（毫秒） | 默认 `400`，每次翻倍 |
+| 「可能已送达」也重试 | 默认开。对「请求可能已到达服务端之后连接被重置」也重试；若重复一次请求会产生费用，可关掉（关掉后只重试确定未送达的失败） |
 
 也可以只设环境变量，等价于「代理地址」（走不走代理仍由两个域名名单决定）：
 
@@ -147,15 +154,23 @@ dsh --profile <profile名>     # 重启生效
 
 ```bash
 pnpm install
-pnpm typecheck   # 对着真实的 DSH 0.1.7 类型声明检查
-pnpm test        # 不联网：自清理（profile 补丁）+ volatile 配置契约 + 路由判定 + 系统代理解析 + 设置页渲染
+pnpm typecheck   # 对着真实的 DSH 类型声明检查
+pnpm test        # 不联网：自清理（profile 补丁）+ volatile 配置契约 + 稳定性契约 + 路由判定与豁免
+                 #        + 连接级重试 + 多实例装卸 + 系统代理解析 + 设置页渲染
 pnpm build       # 生成 lib/，需一并提交
 pnpm pack        # 生成 dsh-proxy-<version>.tgz，可用 file: 路径直接装
 ```
 
+测试清单见 [TESTING.md](TESTING.md)：说「全局测试」时按那份列表逐项跑，说「更新测试列表」时才改它；日常只改了什么就只跑对应那几项。
+
+版本库约定（对应 `.gitignore`）：`lib/**` —— 包括 `lib/index.js`、`lib/profile-patch.js`、`lib/client.js`、`lib/client.js.map` 与 `lib/types/**` —— **故意提交**，这样从 GitHub 或 tarball 安装都不需要构建步骤；`node_modules/`、`dist/`、`build/`、`out/`、`coverage/`、`*.tsbuildinfo`、`*.tgz`、`*.log`、`*.prune.tmp`、`.env*`、编辑器目录（`.vscode/`、`.idea/`）与 `.pnpm-store/` 都在忽略之列。**改了源码必须 `pnpm build` 并把 `lib/**` 一起提交**，否则装进 DSH 的还是旧代码（本次 0.5.0 就是源码与 `lib/` 同一次提交）。
+
 `pnpm build` 是双 entry：`lib/index.js`（host 半）与 `lib/profile-patch.js`（自清理，单独成文件是为了能脱离 undici / schemastery 单独测试）。`lib/client.js` 与 `lib/types/**` 也要一起提交。
 
+host 半的模块划分：`index.ts`（生命周期与两层装卸）、`dispatch.ts`（进程级 dispatcher：按 hostname 分流、豁免判定、多实例安装栈）、`proxy.ts`（两条通道的构建与路由包裹层）、`stability.ts`（超时/重试参数、范围钳制、undici 选项）、`retry.ts`（连接级重试与可重放判定）、`config.ts`（volatile 配置与防御式读取）、`hosts.ts`（域名整树匹配与回环/内网豁免）、`system-proxy.ts` 与 `profile-patch.ts` 各司其职。
+
 `test/profile-patch-test.mjs`（profile 行的改写：删除 / 只清 `config` / 读取 `disabled` 与 bundle 选择）、`test/unload-cleanup-test.mjs`（把一个临时 profile 喂给 `apply`，再拆掉 fiber，看它到底改了什么）与 `test/system-proxy-test.mjs`（系统代理的解析：Windows 注册表输出、`ProxyServer` 两种写法、`scutil`、GSettings、环境变量兜底与平台回退）都不联网、不碰真实 profile 与注册表，可以单独跑：`node test/profile-patch-test.mjs` / `node test/unload-cleanup-test.mjs` / `node test/system-proxy-test.mjs`。
+`test/routing-dispatcher-test.mjs`（分流与豁免：名单命中→代理通道、未命中→加固直连、排除域名优先、回环与内网段（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`fc00::/7`、`fe80::/10`、`.local` 等）永不代理、畸形 origin 一律 fail-open 走直连、`close` / `destroy` 是否收掉两条通道、多实例安装栈与「第三方替换后我们不回收」）与 `test/retry-test.mjs`（哪些失败可重试、`retryOnPossibleDelivery` 的开关语义、不可重放的请求体只发一次、调用方 abort 立刻打断退避、`maxRetries: 0` 时函数恒等）都不联网、不需要代理。
 `test/proxy-*.mjs` 需要网络和一个可用代理，不参与 `pnpm test`。
 客户端用例会给 `*.module.css`、`clsx`、`simple-icons`、`shiki`、`@deepseek-ai/dsh-client-store` 这些由 DSH 外壳打包提供的依赖打桩（见 `test/primitives-hook.mjs`），其余都是真代码。
 

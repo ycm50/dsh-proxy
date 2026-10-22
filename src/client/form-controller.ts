@@ -47,6 +47,18 @@ export interface HttpProxySettings {
   useSystemProxy?: boolean
   /** Whether child processes (plugin install/update) inherit the proxy. */
   proxySubprocesses?: boolean
+  /** Ceiling for a TCP connect and for a proxy CONNECT tunnel, in milliseconds. */
+  connectTimeoutMs?: number
+  /** Ceiling for waiting on response headers; 0 disables the watchdog. */
+  responseTimeoutMs?: number
+  /** Ceiling for the gap between streaming body chunks; 0 disables it. */
+  streamIdleTimeoutMs?: number
+  /** Transport-level retries for connection failures (0 turns them off). */
+  retryCount?: number
+  /** First backoff delay for a transport retry. */
+  retryDelayMs?: number
+  /** Whether a reset that may have arrived after delivery is retried too. */
+  retryOnPossibleDelivery?: boolean
 }
 
 /** The `llm-pi-ai` section subset this page reads for known model gateways. */
@@ -57,12 +69,29 @@ export interface PiAiSettings {
 /** The two host-list fields, which share one control shape. */
 export type HostFieldName = 'proxyHosts' | 'excludeHosts'
 
+/** The staged on/off switches of the stability group, and the subprocess one. */
+export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'retryOnPossibleDelivery'
+
+/**
+ * The numeric fields of the stability group.
+ *
+ * They are staged as text like every other field, so the draft is what the user
+ * typed and the Host schema stays the only judge of what is acceptable; the
+ * page shows its verdict as the field's invalid state.
+ */
+export type NumberFieldName =
+  | 'connectTimeoutMs'
+  | 'responseTimeoutMs'
+  | 'streamIdleTimeoutMs'
+  | 'retryCount'
+  | 'retryDelayMs'
+
 /** One editable field of the page. */
 export type FieldName =
   | 'proxy'
   | HostFieldName
-  | 'useSystemProxy'
-  | 'proxySubprocesses'
+  | BooleanFieldName
+  | NumberFieldName
 
 /**
  * A host-list field: one line of text over a `string[]`.
@@ -101,6 +130,32 @@ function settingsBooleanField(field: string): SettingsFieldSpec {
     field,
     format: (value) => (value === true ? 'true' : 'false'),
     parse: (text) => ({ kind: 'set', value: text.trim().toLowerCase() === 'true' }),
+  }
+}
+
+/**
+ * A numeric field: one line of text over a number.
+ *
+ * Empty clears the field (which hands the Host its default back), and anything
+ * that does not read as a finite number is staged as typed rather than silently
+ * coerced — the schema rejects it and the page marks the field invalid, which is
+ * the honest outcome for "60000ms" typed into a millisecond box.
+ * @param field - field name inside the namespace section.
+ * @returns the field's conversion spec.
+ */
+function settingsNumberField(field: string): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+      return typeof value === 'string' ? value : ''
+    },
+    parse: (text) => {
+      const trimmed = text.trim()
+      if (trimmed.length === 0) return { kind: 'clear' }
+      const numeric = Number(trimmed)
+      return { kind: 'set', value: Number.isFinite(numeric) ? numeric : trimmed }
+    },
   }
 }
 
@@ -149,6 +204,18 @@ export interface HttpProxyFormState extends SettingsFormShell {
   /** Staged "route every request through the proxy" switch. */
   /** Staged "child processes inherit the proxy" switch. */
   proxySubprocesses: SettingsFieldState
+  /** Staged connect ceiling, in milliseconds. */
+  connectTimeoutMs: SettingsFieldState
+  /** Staged response-header ceiling, in milliseconds. */
+  responseTimeoutMs: SettingsFieldState
+  /** Staged streaming idle ceiling, in milliseconds. */
+  streamIdleTimeoutMs: SettingsFieldState
+  /** Staged connection retry budget. */
+  retryCount: SettingsFieldState
+  /** Staged first backoff delay, in milliseconds. */
+  retryDelayMs: SettingsFieldState
+  /** Staged "retry a possibly-delivered failure too" switch. */
+  retryOnPossibleDelivery: SettingsFieldState
   /** Known model hostnames offered beside the host fields (free text still allowed). */
   suggestions: string[]
 }
@@ -192,7 +259,13 @@ export class HttpProxyFormController {
       settingsHostListField('proxyHosts'),
       settingsHostListField('excludeHosts'),
       settingsBooleanField('useSystemProxy'),
-          settingsBooleanField('proxySubprocesses'),
+      settingsBooleanField('proxySubprocesses'),
+      settingsNumberField('connectTimeoutMs'),
+      settingsNumberField('responseTimeoutMs'),
+      settingsNumberField('streamIdleTimeoutMs'),
+      settingsNumberField('retryCount'),
+      settingsNumberField('retryDelayMs'),
+      settingsBooleanField('retryOnPossibleDelivery'),
     ])
     // The shared mirror is the one `settings.describe` reader in the browser;
     // reading the `llm-pi-ai` gateways through it keeps this page from opening
@@ -260,7 +333,13 @@ export class HttpProxyFormController {
       proxyHosts: this.form.field('proxyHosts'),
       excludeHosts: this.form.field('excludeHosts'),
       useSystemProxy: this.form.field('useSystemProxy'),
-          proxySubprocesses: this.form.field('proxySubprocesses'),
+      proxySubprocesses: this.form.field('proxySubprocesses'),
+      connectTimeoutMs: this.form.field('connectTimeoutMs'),
+      responseTimeoutMs: this.form.field('responseTimeoutMs'),
+      streamIdleTimeoutMs: this.form.field('streamIdleTimeoutMs'),
+      retryCount: this.form.field('retryCount'),
+      retryDelayMs: this.form.field('retryDelayMs'),
+      retryOnPossibleDelivery: this.form.field('retryOnPossibleDelivery'),
       suggestions: this.suggestions(),
     }
   }

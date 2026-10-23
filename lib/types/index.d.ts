@@ -2,8 +2,11 @@
  * `dsh-proxy`: route model-API requests through an HTTP/SOCKS proxy
  * without modifying DeepSeek Harness source. It wraps `globalThis.fetch` —
  * the transport both the DeepSeek adapter and the pi-ai SDK clients use — and
- * sends only model-API hosts through a proxy dispatcher. Web search, web
- * fetch, MCP, and every other host keep the direct path.
+ * decides, per host, whether a request takes the proxy or this plugin's hardened
+ * direct channel. A host on the force list always takes the proxy; every other
+ * host starts direct and moves onto the proxy only when direct does not answer
+ * within a second or fails outright, and the channel that answers is kept for
+ * the session (see `dsh-proxy/routing`).
  *
  * The settings seam is DSH 0.1.7's: a `volatile()` config field is edited in
  * place by the settings document, so the running instance re-reads the value
@@ -23,8 +26,8 @@ export { DEFAULT_STABILITY, HAPPY_EYEBALLS_ATTEMPT_MS, POOLED_IDLE_MAX_MS, POOLE
 export type { HardenedAgentOptions, HardenedConnectOptions, StabilityConfig, StabilityField } from './stability.js';
 export { ProxyObserver, observerFromEnv } from './observe.js';
 export type { ObservedChannel, ObserverOptions, ObserverStats, ObserverSummary, RequestSample, } from './observe.js';
-export { ChannelRotation, FIRST_CHANNEL, describeRotation, otherChannel, } from './routing.js';
-export type { RouteAttempt, RouteChannel } from './routing.js';
+export { FIRST_CHANNEL, PROBE_TIMEOUT_CODE, PROBE_TIMEOUT_MS, RouteMemory, describeRouting, otherChannel, } from './routing.js';
+export type { RouteAttempt, RouteChannel, RouteDecision, RouteState } from './routing.js';
 export { isAborted, isReplayableRequest, isRetryableTransportError, transportCodeOf, withTransportRetry, } from './retry.js';
 export type { RetryAttempt, RetryPolicy } from './retry.js';
 export { PROXY_ENV_NAMES, WINDOWS_INTERNET_SETTINGS_KEY, normalizeProxyValue, parseGsettingsValue, parseScutilProxy, parseWindowsProxyServer, parseWindowsRegistry, pickWindowsProxy, readEnvironmentProxy, readMacSystemProxy, readSystemProxy, readWindowsSystemProxy, } from './system-proxy.js';

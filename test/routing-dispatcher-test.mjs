@@ -5,7 +5,7 @@
 // No network: both channels are fakes that record which one a request reached.
 import { getGlobalDispatcher, setGlobalDispatcher } from 'undici'
 import {
-  ChannelRotation,
+  RouteMemory,
   RoutingDispatcher,
   installGlobalDispatcher,
   isExemptHostname,
@@ -74,7 +74,11 @@ const channel = (name) => ({
 
 const direct = channel('direct')
 const proxied = channel('proxied')
-const routing = new RoutingDispatcher({ direct, proxied, proxyFor: (host) => host.endsWith('.wbzai.cn') })
+const routing = new RoutingDispatcher({
+  direct,
+  proxied,
+  channelFor: (host) => (host.endsWith('.wbzai.cn') ? 'proxy' : 'direct'),
+})
 
 const call = (origin) => {
   log.length = 0
@@ -85,7 +89,7 @@ check('listed host goes through the proxy', call('https://zzz.wbzai.cn/v1/models
 check('unlisted host stays on our direct channel', call('https://api.github.com/zen'), 'direct')
 
 // Exemptions outrank the routed list: even a predicate that says "proxy everything".
-const forceAll = new RoutingDispatcher({ direct, proxied, proxyFor: () => true })
+const forceAll = new RoutingDispatcher({ direct, proxied, channelFor: () => 'proxy' })
 const callAll = (origin) => {
   log.length = 0
   forceAll.dispatch({ origin }, {})
@@ -104,16 +108,16 @@ log.length = 0
 check('dispatch with no origin returns the channel result', routing.dispatch({}, {}), true)
 check('no origin goes direct', log[0], 'direct')
 
-// --- 3b. The dispatcher path moves the same cursor the wrapper does --------
+// --- 3b. The dispatcher path settles the same memory the wrapper does ------
 // Callers that captured `fetch` before this plugin mounted reach the network
-// through this dispatcher and never touch the wrapper, so the rotation has to be
-// driven from here too: an error moves the host to the other channel, response
-// headers keep it where it is. Without this the retries of those callers all
-// land on one channel — "four attempts, none of them connected".
+// through this dispatcher and never touch the wrapper, so the choice has to be
+// settled from here too: a failure moves the host to the other channel once and
+// response headers keep it. Without this those callers keep landing on the
+// channel that just failed — "four attempts, none of them connected".
 {
   const seen = []
   const outcomes = []
-  const rotation = new ChannelRotation()
+  const memory = new RouteMemory()
   const failing = {
     dispatch(_options, handler) {
       seen.push('direct')
@@ -133,26 +137,32 @@ check('no origin goes direct', log[0], 'direct')
   const observed = new RoutingDispatcher({
     direct: failing,
     proxied: working,
-    proxyFor: (host) => rotation.channelFor(host) === 'proxy',
-    rotateFor: (host) => !isExemptHostname(host),
-    onOutcome: (record) => { rotation.record(record.hostname, record.ok); outcomes.push(record) },
+    channelFor: (host) => memory.decide(host).channel,
+    learnFor: (host) => !isExemptHostname(host),
+    onOutcome: (record) => {
+      if (record.ok) memory.settle(record.hostname, record.channel)
+      else memory.failed(record.hostname, record.channel)
+      outcomes.push(record)
+    },
   })
   const handler = { onConnect() {}, onHeaders() { return false }, onData() { return false }, onComplete() {}, onError() {} }
   const call = () => observed.dispatch({ origin: 'https://api.example', path: '/v1/chat', method: 'POST' }, handler)
-  call()  // direct, fails -> the cursor moves to the proxy
-  call()  // proxy, answers -> the cursor moves on again
-  call()  // direct again
-  check('the dispatcher path alternates on every attempt', seen, ['direct', 'proxy', 'direct'])
+  call()  // direct, fails -> the memory probes the proxy
+  call()  // proxy, answers -> settles on the proxy
+  call()  // proxy again: the answer is kept
+  check('the dispatcher path settles and then stays', seen, ['direct', 'proxy', 'proxy'])
   check('the failure is recorded with its channel and code',
     [outcomes[0].ok, outcomes[0].channel, outcomes[0].code], [false, 'direct', 'ECONNREFUSED'])
   check('an answered dispatch is recorded as ok',
     [outcomes[1].ok, outcomes[1].channel, typeof outcomes[1].ms], [true, 'proxy', 'number'])
+  check('the memory keeps the proxy', memory.decide('api.example'),
+    { channel: 'proxy', probe: false, fallback: false })
 
-  // A loopback/LAN host has no cursor to move, so it is not observed at all.
+  // A loopback/LAN host has no channel to decide, so it is not observed at all.
   seen.length = 0
   observed.dispatch({ origin: 'http://127.0.0.1:9/x' }, handler)
   check('an exempt host takes direct and is never observed',
-    [seen, rotation.stateOf('127.0.0.1') ?? '(none)'], [['direct'], '(none)'])
+    [seen, memory.stateOf('127.0.0.1') ?? '(none)'], [['direct'], '(none)'])
 }
 
 // --- 4. Teardown propagation -------------------------------------------------

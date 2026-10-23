@@ -2,8 +2,11 @@
  * `dsh-proxy`: route model-API requests through an HTTP/SOCKS proxy
  * without modifying DeepSeek Harness source. It wraps `globalThis.fetch` —
  * the transport both the DeepSeek adapter and the pi-ai SDK clients use — and
- * sends only model-API hosts through a proxy dispatcher. Web search, web
- * fetch, MCP, and every other host keep the direct path.
+ * decides, per host, whether a request takes the proxy or this plugin's hardened
+ * direct channel. A host on the force list always takes the proxy; every other
+ * host starts direct and moves onto the proxy only when direct does not answer
+ * within a second or fails outright, and the channel that answers is kept for
+ * the session (see `dsh-proxy/routing`).
  *
  * The settings seam is DSH 0.1.7's: a `volatile()` config field is edited in
  * place by the settings document, so the running instance re-reads the value
@@ -19,6 +22,8 @@ import type { Context } from '@deepseek-ai/cordis'
 // Type-only: pulls in the `Context.settings` augmentation without importing a
 // value, so the module's named exports are not part of this module's link step.
 import type {} from '@deepseek-ai/dsh-settings'
+// Type-only: declares the `session/created` event this plugin resets on.
+import type {} from '@deepseek-ai/dsh-session'
 // Type-only: declares the `loader/volatile-update` event below.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { assertValid, Config, isValidSubprocessProxy, readConfig } from './config.js'
@@ -41,8 +46,8 @@ import { describeStability, stabilityIsDefault } from './stability.js'
 import type { StabilityConfig } from './stability.js'
 import { observerFromEnv } from './observe.js'
 import type { ProxyObserver } from './observe.js'
-import { ChannelRotation, describeRotation } from './routing.js'
-import type { RouteAttempt } from './routing.js'
+import { PROBE_TIMEOUT_MS, RouteMemory, describeRouting } from './routing.js'
+import type { RouteAttempt, RouteChannel } from './routing.js'
 import type { RetryAttempt } from './retry.js'
 import { planRowCleanup, pruneProxyEntryFromProfile, stripProxyEntryConfigFromProfile } from './profile-patch.js'
 import { installSystemProxyRpc } from './rpc.js'
@@ -98,12 +103,14 @@ export type {
   RequestSample,
 } from './observe.js'
 export {
-  ChannelRotation,
   FIRST_CHANNEL,
-  describeRotation,
+  PROBE_TIMEOUT_CODE,
+  PROBE_TIMEOUT_MS,
+  RouteMemory,
+  describeRouting,
   otherChannel,
 } from './routing.js'
-export type { RouteAttempt, RouteChannel } from './routing.js'
+export type { RouteAttempt, RouteChannel, RouteDecision, RouteState } from './routing.js'
 export {
   isAborted,
   isReplayableRequest,
@@ -414,11 +421,10 @@ function releaseSubprocessExport(token: symbol): boolean {
 /**
  * Collect the one hostname set a routing decision is made from: the force list.
  *
- * It is the only list left. A pinned host always travels through the proxy and
- * never alternates channels; every other host starts direct and rotates to the
- * proxy on its retries (see `dsh-proxy/routing`), so there is no second list to
- * judge against and no exclusion to subtract — the settings page can promise
- * exactly that.
+ * It is the only list left. A pinned host always travels through the proxy; every
+ * other host is decided once by `RouteMemory` and then kept on the channel that
+ * answered (see `dsh-proxy/routing`), so there is no second list to judge against
+ * and no exclusion to subtract — the settings page can promise exactly that.
  *
  * Every entry is an umbrella: `a.b` covers `a.b` and the whole subtree under it
  * (see `matchesHostEntry`), so a domain is named once rather than per endpoint.
@@ -493,9 +499,9 @@ function liveFlag(reference: unknown): boolean {
  * file beside it.
  *
  * The file is the point. The desktop build's host log is not written anywhere
- * the user can read, so without it the record the rotation produces — which
- * channel each attempt took, and why it failed — is invisible exactly when it
- * matters. Writing it is therefore a **switch**: `debugLog` in the settings
+ * the user can read, so without it the record the routing decision produces —
+ * which channel each attempt took, whether it settled the host, and why it
+ * failed — is invisible exactly when it matters. Writing it is therefore a **switch**: `debugLog` in the settings
  * page, read live, so turning it on records the next attempt without a restart.
  * A non-empty `DSH_PROXY_LOG` turns it on too, for capturing a start-up that
  * never gets as far as the settings page, and overrides the path.
@@ -534,30 +540,56 @@ function recordSink(ctx: Context, enabled: () => boolean): (line: string) => voi
 }
 
 /**
+ * One failure message, flattened onto a single log line and cut to a readable
+ * length. A message is the only clue a failure without a transport code leaves,
+ * and a multi-line one would split the record it belongs to.
+ * @param message - the error's message.
+ * @returns the text for the log line.
+ */
+function oneLine(message: string): string {
+  const flat = message.replace(/\s+/g, ' ').trim()
+  return flat.length > 160 ? flat.slice(0, 157) + '...' : flat
+}
+
+/**
  * Build this instance's per-attempt recorder.
  *
- * The user asked for the rotation to be visible, so every attempt is written
- * down: which channel it took, which attempt it was, what it cost, and — when it
- * failed — the transport code that moved the host to the other channel. A
- * successful first attempt is the common case and stays a single short line; the
- * interesting shape (direct failing, proxy answering) is exactly the pair of
- * lines that explains a bad path.
+ * The user asked for the decision to be visible, so every attempt is written
+ * down: which channel it took, which attempt it was, what it cost, and what that
+ * bought — a probe that passed and settled the host, a channel kept because it
+ * already answered, or the channel the next attempt will try. A successful first
+ * attempt is the common case and stays a single short line; the interesting shape
+ * (direct silent, proxy answering) is exactly the pair of lines that explains a
+ * bad path. A failure with no transport code carries its message instead, so a
+ * code-less error is never invisible.
  * @param ctx - the Cordis context, for the logger.
  * @returns the recorder handed to the routing wrapper.
  */
 function makeAttemptRecorder(sink: (line: string) => void): (attempt: RouteAttempt) => void {
   return (attempt) => {
-    const outcome = attempt.ok
-      ? 'ok'
-      : 'failed' + (attempt.code !== undefined && attempt.code.length > 0 ? ' ' + attempt.code : '')
-    const next = attempt.attempt < attempt.maxAttempts
-      ? 'next attempt takes the other channel'
-      : 'no attempts left'
+    const code = attempt.code !== undefined && attempt.code.length > 0 ? attempt.code : ''
+    const detail = code.length > 0
+      ? ' ' + code
+      : attempt.message !== undefined && attempt.message.length > 0
+        ? ' (' + oneLine(attempt.message) + ')'
+        : ''
+    const outcome = attempt.ok ? 'ok' : 'failed' + detail
+    const decision = attempt.ok
+      ? (attempt.probe !== true
+        ? 'kept on ' + attempt.channel
+        : 'probe passed, ' + attempt.channel + ' kept for this host')
+      : attempt.code === 'UND_ERR_ABORTED'
+        // The harness cancelling a request (Stop, or the process shutting down)
+        // is not the channel's verdict, so it must not read like one.
+        ? 'cancelled by the caller'
+        : attempt.next === undefined
+          ? 'no attempts left'
+          : 'next attempt via ' + attempt.next
     sink(
       'dsh-proxy: ' + (attempt.hostname.length > 0 ? attempt.hostname : '(unparseable url)')
       + ' attempt ' + String(attempt.attempt) + '/' + String(attempt.maxAttempts)
       + ' via ' + attempt.channel + ' -> ' + outcome
-      + ' in ' + String(attempt.ms) + 'ms (' + next + ')',
+      + ' in ' + String(attempt.ms) + 'ms (' + decision + ')',
     )
   }
 }
@@ -619,7 +651,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     force: Set<string>
     stability: StabilityConfig
     routing: RoutingDispatcher
-    rotation: ChannelRotation
+    memory: RouteMemory
   } | undefined
   /** This instance's live global-dispatcher install, when it holds one. */
   let dispatcherInstalled: symbol | undefined
@@ -882,7 +914,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     let direct: HardenedChannel
     let proxied: HardenedChannel
     let routing: RoutingDispatcher
-    let rotation: ChannelRotation
+    let memory: RouteMemory
     let onAttempt: (attempt: RouteAttempt) => void
     let onRetry: (attempt: RetryAttempt) => void
     try {
@@ -895,35 +927,49 @@ export function apply(ctx: Context, config: PluginConfig): void {
       // name still gets the long connect ceiling and the keepalive, rather than
       // falling back to undici's 10 second connect timeout — the failure this
       // plugin exists to remove. The retry budget is deliberately *not* given to
-      // the channels: the routing wrapper runs the retry loop, because each
-      // attempt has to take a different channel (see `dsh-proxy/routing`).
+      // the channels: the routing wrapper runs the loop, because it — not the
+      // channel — decides which path each attempt takes (see `dsh-proxy/routing`).
       const observation = observer === undefined ? {} : { observer }
       const channelStability = { ...stability, retryCount: 0 }
       direct = createHardenedChannel(undefined, { stability: channelStability, onRetry, ...observation })
       proxied = createHardenedChannel(proxyUrl, { stability: channelStability, onRetry, ...observation })
-      // One rotation per generation: which channel a host is on is a function of
-      // the failures that generation saw, so a rebuilt generation starts every
-      // host from direct again.
-      rotation = new ChannelRotation()
+      // One memory per generation: which channel a host is on is a function of
+      // the answers that generation saw, so a rebuilt generation starts every
+      // host from direct again. A new session clears it too (see below).
+      memory = new RouteMemory()
       onAttempt = makeAttemptRecorder(sink)
       routing = new RoutingDispatcher({
         direct: direct.dispatcher,
         proxied: proxied.dispatcher,
-        // Synchronous by contract, and pure: the channel is read from the
-        // rotation, never advanced here.
-        proxyFor: (hostname) => !isExemptHostname(hostname)
-          && (shouldForceProxy(hostname, force) || rotation.channelFor(hostname) === 'proxy'),
+        // Synchronous and pure by contract: the channel is read from the memory,
+        // never advanced here.
+        channelFor: (hostname) => isExemptHostname(hostname)
+          ? 'direct'
+          : shouldForceProxy(hostname, force)
+            ? 'proxy'
+            : memory.decide(hostname).channel,
         // The dispatcher serves the callers that captured `fetch` before this
-        // plugin mounted, so it has to move the same cursor the wrapped path
-        // moves — otherwise those callers retry on one channel forever, which
-        // is exactly the "four attempts, none of them connected" shape.
-        rotateFor: (hostname) => !isExemptHostname(hostname) && !shouldForceProxy(hostname, force),
+        // plugin mounted, so it has to settle the same memory the wrapped path
+        // settles — otherwise those callers keep landing on a channel that just
+        // failed, which is exactly the "four attempts, none of them connected"
+        // shape.
+        learnFor: (hostname) => !isExemptHostname(hostname) && !shouldForceProxy(hostname, force),
         onOutcome: (record) => {
-          const next = rotation.record(record.hostname)
+          let next: RouteChannel | undefined
+          if (record.ok) {
+            memory.settle(record.hostname, record.channel)
+            next = record.channel
+          } else {
+            next = memory.failed(record.hostname, record.channel)?.channel
+          }
           sink(
             'dsh-proxy: ' + record.hostname + ' via ' + record.channel + ' (dispatcher) -> '
             + (record.ok ? 'ok' : 'failed' + (record.code === undefined || record.code.length === 0 ? '' : ' ' + record.code))
-            + ' in ' + String(record.ms) + 'ms (next via ' + next + ')',
+            + ' in ' + String(record.ms) + 'ms ('
+            + (record.ok
+              ? 'kept on ' + record.channel
+              : next === undefined ? 'no further attempt' : 'next via ' + next)
+            + ')',
           )
         },
       })
@@ -942,9 +988,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
       'dsh-proxy: routing generation installed — proxy=' + proxyUrl
       + ' forced=' + String(force.size)
       + ' retry=' + String(stability.retryCount) + 'x' + String(stability.retryDelayMs) + 'ms'
-      + ' rotate=' + describeRotation(Math.max(1, 1 + stability.retryCount)),
+      + ' ' + describeRouting(Math.max(1, 1 + stability.retryCount), PROBE_TIMEOUT_MS),
     )
-    const next = { proxyUrl, force, stability, routing, rotation }
+    const next = { proxyUrl, force, stability, routing, memory }
     const previous = active
     active = next
     // Retire this instance's previous wrapper *before* looking at the global:
@@ -971,10 +1017,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
     const wrapper = createRoutingFetch({
       proxy: proxied.fetch,
       direct: direct.fetch,
-    }, rotation, {
+    }, memory, {
       retryCount: stability.retryCount,
       baseDelayMs: stability.retryDelayMs,
       retryOnPossibleDelivery: stability.retryOnPossibleDelivery,
+      // The 1-second decision budget: a host that is on no list starts direct
+      // and only moves to the proxy when direct stays silent for this long.
+      probeTimeoutMs: PROBE_TIMEOUT_MS,
       // The force list, and only the force list: the routing layer applies the
       // built-in loopback/LAN exemption itself, so a pinned name can never be
       // made to leave the machine.
@@ -989,7 +1038,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       'dsh-proxy: routing installed — forced hosts %d, %s, %s',
       force.size,
       describeStability(stability),
-      describeRotation(Math.max(1, 1 + stability.retryCount)),
+      describeRouting(Math.max(1, 1 + stability.retryCount), PROBE_TIMEOUT_MS),
     )
     // Publish the new wrapper before closing the old dispatcher, so requests
     // started after this point always land on the live dispatcher.
@@ -1018,6 +1067,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
     // The observer holds a process-wide subscription; it must not outlive the
     // fiber that installed it.
     observer?.dispose()
+  })
+
+  // "The first request of a session goes direct": every new conversation starts
+  // with an empty memory, so a host that settled on the proxy in the previous
+  // conversation probes direct again instead of inheriting that decision.
+  ctx.on('session/created', () => {
+    active?.memory.reset()
   })
 
   // DSH edits this plugin's configuration in place: the Loader commits the new

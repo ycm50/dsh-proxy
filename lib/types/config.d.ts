@@ -32,11 +32,12 @@ export interface HttpProxyConfig {
     /**
      * Hostnames pinned to the proxy: the only list there is.
      *
-     * A host named here always travels through the proxy and never alternates
-     * channels. It is the answer for a site that is reachable directly but
-     * throttled hard enough that trying is pointless — a mirror that answers in
-     * 30 s direct and in 2 s through the proxy. Every other host starts direct and
-     * rotates to the proxy on its retries (see `dsh-proxy/routing`).
+     * A host named here always travels through the proxy: no direct probe, no
+     * fallback, no memory. It is the answer for a site that is reachable directly
+     * but throttled hard enough that trying is pointless — a mirror that answers
+     * in 30 s direct and in 2 s through the proxy. Every other host starts direct
+     * and moves onto the proxy only when direct does not answer in time or fails
+     * (see `dsh-proxy/routing`).
      */
     forceHosts: string[];
     /**

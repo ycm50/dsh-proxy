@@ -28,6 +28,10 @@ const NOT_DELIVERED = new Set([
   'ECONNREFUSED',
   'UND_ERR_CONNECT_TIMEOUT',
   'EAI_AGAIN',
+  // A name that does not resolve is the classic "the direct path is blocked"
+  // failure, and the failure a proxy fixes: it must qualify for the failover to
+  // the proxy channel.
+  'ENOTFOUND',
   'ENETUNREACH',
   'EHOSTUNREACH',
   'ENETDOWN',

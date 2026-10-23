@@ -3,11 +3,12 @@
  *
  * The plugin does not touch DeepSeek Harness source. It installs a wrapper
  * around `globalThis.fetch` — which both the DeepSeek adapter's raw `fetch` and
- * the pi-ai SDK clients call — and routes model-API hosts through a proxy
- * dispatcher, leaving every other host on this plugin's own **hardened direct**
- * channel. Only the hosts the configuration names are routed; `excludeHosts`
- * always stays direct, and loopback and private networks are exempt on top of
- * that (see {@link isExemptHostname}).
+ * the pi-ai SDK clients call — and decides, per host, whether a request takes the
+ * proxy or this plugin's own **hardened direct** channel. Hosts on the force list
+ * always take the proxy; every other host starts direct and only moves onto the
+ * proxy when direct does not answer in time or fails outright (see
+ * {@link RouteMemory}). Loopback and private networks are exempt throughout (see
+ * {@link isExemptHostname}).
  *
  * Both channels are built from the same hardened options (see
  * `dsh-proxy/stability`): a long connect ceiling, TCP keepalive, a bounded
@@ -21,7 +22,7 @@ import { Dispatcher } from 'undici';
 import type { StabilityConfig } from './stability.js';
 import type { RetryAttempt } from './retry.js';
 import type { ProxyObserver } from './observe.js';
-import type { ChannelRotation, RouteAttempt } from './routing.js';
+import type { RouteAttempt, RouteMemory } from './routing.js';
 export { DEFAULT_DEEPSEEK_HOST, DEFAULT_MODEL_HOST_SUFFIXES, DEFAULT_MODEL_HOSTS, hostnameOf, isLanHostname, matchesHostEntry, normalizeHostEntry, } from './hosts.js';
 /** Extract the absolute URL string from a `fetch` input. */
 export declare function urlOf(input: string | URL | Request): string;
@@ -65,11 +66,12 @@ export declare function isExemptHostname(hostname: string): boolean;
 /**
  * Whether a hostname is pinned to the proxy by the force list.
  *
- * The force list is the one list left: a host named there always travels through
- * the proxy, and it is the answer for a site that *can* be reached directly but
- * is throttled hard enough that trying is pointless — a mirror that answers in
- * 30 s direct and in 2 s through the proxy. A pinned host never alternates
- * channels (see `dsh-proxy/routing`): there is no direct attempt to rotate to.
+ * The force list is the one list there is: a host named there always travels
+ * through the proxy, and it is the answer for a site that *can* be reached
+ * directly but is throttled hard enough that trying is pointless — a mirror that
+ * answers in 30 s direct and in 2 s through the proxy. A pinned host never
+ * probes and never moves (see `dsh-proxy/routing`): there is no direct attempt to
+ * compare against.
  *
  * The built-in exemption still outranks it: loopback and private networks never
  * travel at all, whatever the list says.
@@ -133,7 +135,8 @@ export interface NormalisedCall {
  *
  * So a foreign request is taken apart instead of forwarded: its URL, method,
  * headers, body and the rest are copied into a plain init the bundled undici can
- * read. A `Request` this plugin built itself is passed through untouched.
+ * read. The body is copied as bytes, never as decoded text. A `Request` this
+ * plugin built itself is passed through untouched.
  * @param input - the fetch input.
  * @param init - the fetch init, if any.
  * @returns the input and init to call the bundled fetch with.
@@ -162,7 +165,7 @@ export declare function createHardenedChannel(proxyUrl: string | undefined, opti
  * @returns the proxy-bound fetch and its dispatcher closer.
  */
 export declare function createProxyFetch(proxyUrl: string): ProxyFetch;
-/** The two fetch shapes the routing layer alternates between. */
+/** The two fetch shapes the routing layer chooses between. */
 export interface RoutingChannels {
     /** The hardened proxy channel. */
     proxy: typeof fetch;
@@ -178,11 +181,19 @@ export interface RoutingOptions {
     /** Whether a failure that may already have been delivered is retried too. */
     retryOnPossibleDelivery: boolean;
     /**
+     * How long an unproven channel gets to answer, in milliseconds.
+     *
+     * Absent takes {@link PROBE_TIMEOUT_MS}. The budget applies only while a host's
+     * channel is still being decided (see `dsh-proxy/routing`); a host that has
+     * already been settled is never cut off by it.
+     */
+    probeTimeoutMs?: number;
+    /**
      * Whether the configuration pins this hostname to the proxy.
      *
-     * A pinned host has no direct path to rotate to, so it makes every attempt on
-     * the proxy; the built-in loopback/LAN exemption is applied here too, so a
-     * pinned name can never be made to leave the machine.
+     * A pinned host has no direct path and therefore nothing to probe; the built-in
+     * loopback/LAN exemption is applied here too, so a pinned name can never be
+     * made to leave the machine.
      */
     forcedProxy?(hostname: string): boolean;
     /** Called once per finished attempt: the record the user asked for. */
@@ -191,7 +202,8 @@ export interface RoutingOptions {
     onRetry?(attempt: RetryAttempt): void;
 }
 /**
- * Wrap the two channels so every request alternates between them on its retries.
+ * Wrap the two channels so each host is decided once and then kept on the
+ * channel that answered.
  *
  * The direct argument is deliberately the plugin's **hardened direct** fetch
  * rather than the platform fetch: a host the configuration does not name still
@@ -199,23 +211,28 @@ export interface RoutingOptions {
  * Falling back to the platform fetch would put it back on undici's 10 second
  * connect timeout, which is the failure this plugin exists to remove.
  *
- * The strategy is {@link ChannelRotation}'s: the first attempt of a host goes
- * direct, and **every** attempt after it takes the other channel — so a run of
- * retries reads direct, proxy, direct, proxy, and one broken path can never
- * consume a whole turn while the other one is healthy. The cursor moves on
- * success too, which is what keeps both paths in use instead of trusting one on
- * the strength of a single good minute. A pinned host skips the rotation.
+ * The strategy is {@link RouteMemory}'s, and it is what the user asked for: a
+ * host that is on no list starts direct with a {@link PROBE_TIMEOUT_MS} budget;
+ * answering settles it on direct for the session, and only a direct path that
+ * stays silent hands it to the proxy (same budget). The channel that answers is
+ * kept, so a healthy host never alternates, while a settled channel that then
+ * fails outright still gets one probe of the other. A pinned host skips all of
+ * it and stays on the proxy.
  *
- * Retrying is still gated the way the transport layer always gated it: the body
- * must be replayable, the caller must not have aborted, and the failure must
- * qualify — a possibly-delivered failure only when `retryOnPossibleDelivery` is
- * on, which is the same rule the single-channel retry applies. Once the budget is
- * spent the original error is rethrown unchanged, so the harness sees the
- * transport code it always saw.
+ * Retrying is gated by whether the request can be sent again: the body must be
+ * replayable and the caller must not have aborted. A failure that may already
+ * have been delivered is resent only when `retryOnPossibleDelivery` is on — and
+ * a failure carrying **no** transport code counts as possibly delivered, because
+ * that is the case where refusing to move would strand the host on a channel
+ * that does not work. What a failure never does is leave the host's decision
+ * where it was: the memory advances even when the request itself must stop.
+ * The probe sequence is the routing decision and is bounded by the memory to
+ * three attempts. Once there is nothing left to try the original error is
+ * rethrown unchanged, so the harness sees the transport code it always saw.
  * @param channels - the proxy fetch and the direct fetch.
- * @param rotation - the per-host channel rotation.
- * @param options - retry budget, pinning, and where attempts are recorded.
+ * @param memory - the per-host channel memory.
+ * @param options - retry budget, probe deadline, pinning, and where attempts are recorded.
  * @returns the routing fetch.
  */
-export declare function createRoutingFetch(channels: RoutingChannels, rotation: ChannelRotation, options: RoutingOptions): typeof fetch;
+export declare function createRoutingFetch(channels: RoutingChannels, memory: RouteMemory, options: RoutingOptions): typeof fetch;
 //# sourceMappingURL=proxy.d.ts.map

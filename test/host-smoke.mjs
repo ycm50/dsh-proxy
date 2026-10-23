@@ -13,7 +13,7 @@ import {
   agentOptionsOf,
   assertValid,
   connectorOptionsOf,
-  describeRotation,
+  describeRouting,
   describeStability,
   headerPairs,
   isExemptHostname,
@@ -197,8 +197,16 @@ check('describeStability flags safe-only retries', describeStability({ ...stock.
   const headers = Object.fromEntries(call.init.headers)
   check('a foreign request becomes its URL', call.input, 'https://a.example/v1/chat')
   check('its method is carried over', call.init.method, 'POST')
-  check('its body is read back out', call.init.body, '{"hi":1}')
+  check('its body is read back out as bytes', Buffer.from(call.init.body).toString('utf8'), '{"hi":1}')
   check('both header sources survive, init last', [headers['x-a'], headers['x-b']], ['1', '2'])
+}
+{
+  // A recording is not text: `text()` replaces every invalid UTF-8 byte with
+  // U+FFFD, so the wav a speech worker received was never the wav that was sent.
+  const bytes = Uint8Array.from([0x52, 0x49, 0x46, 0x46, 0x80, 0x3e, 0x00, 0x00, 0xff])
+  const request = new Request('https://a.example/wav', { method: 'POST', body: bytes })
+  const call = await normaliseFetchCall(request)
+  check('a binary body keeps every byte', [...new Uint8Array(call.init.body)], [...bytes])
 }
 {
   const call = await normaliseFetchCall('https://a.example/x', { headers: { 'x-a': '1' } })
@@ -210,13 +218,16 @@ check('headerPairs reads an array', headerPairs([['a', '1']]), [['a', '1']])
 check('headerPairs reads a Headers instance', headerPairs(new Headers({ a: '1' })), [['a', '1']])
 check('headerPairs has nothing for an absent list', headerPairs(undefined), undefined)
 
-// --- 8. The shipped strategy is the rotation, not a set of knobs -----------
-// The retry budget is the only thing that decides how many attempts a request
-// gets, and the rotation alternates them; the mount log says so.
-check('describeRotation names the shipped strategy',
-  describeRotation(1 + stock.stability.retryCount),
-  'route=rotate (attempt 1 direct, the other channel every attempt after it, up to 4 attempts)')
-check('the retry budget is the attempt budget', describeRotation(1), 'route=rotate (attempt 1 direct, the other channel every attempt after it, up to 1 attempt)')
+// --- 8. The shipped strategy is a remembered choice, not a set of knobs -----
+// The retry budget bounds how many attempts a request gets, and the route line
+// says what the attempts do: direct first with a 1 s probe, the other channel
+// gets the same probe, and the channel that answers is kept.
+check('describeRouting names the shipped strategy',
+  describeRouting(1 + stock.stability.retryCount, 1000),
+  'route=sticky (direct first with a 1000ms probe, the other channel gets the same probe, the channel that answers is kept; up to 4 attempts)')
+check('describeRouting handles a single attempt',
+  describeRouting(1, 1000),
+  'route=sticky (direct first with a 1000ms probe, the other channel gets the same probe, the channel that answers is kept; up to 1 attempt)')
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)

@@ -2,9 +2,13 @@
  * The process-wide dispatch layer: one `RoutingDispatcher` that decides, per
  * request, which of two channels carries it — the hardened direct channel for
  * everything the configuration does not name, the hardened proxy channel for
- * the hosts it does name. Exemptions (loopback, private networks, and the
- * user's own `excludeHosts`) outrank the routed list, so a name that must not
- * travel cannot be made to.
+ * the hosts it does name and for the hosts whose direct path did not answer.
+ * Exemptions (loopback and private networks) outrank the routed list, so a name
+ * that must not travel cannot be made to.
+ *
+ * The channel a host takes is not a per-request coin flip: the caller supplies
+ * a `channelFor` built on the shared per-host memory (see `dsh-proxy/routing`),
+ * so the answer stays put until that channel fails.
  *
  * Why install this as the *global* dispatcher and not only wrap
  * `globalThis.fetch`: a library may capture `fetch`, call `undici.request`, or hold
@@ -25,7 +29,7 @@
  */
 import { Dispatcher } from 'undici';
 import { isExemptHostname } from './proxy.js';
-import type { DispatchRecord } from './routing.js';
+import type { DispatchRecord, RouteChannel } from './routing.js';
 export { isExemptHostname };
 /** One channel pair plus the per-hostname choice between them. */
 export interface RoutingInput {
@@ -33,21 +37,29 @@ export interface RoutingInput {
     direct: Dispatcher;
     /** Channel for hosts the configuration names. */
     proxied: Dispatcher;
-    /** Whether one hostname travels through the proxy (exemptions already applied). */
-    proxyFor(hostname: string): boolean;
     /**
-     * Whether this hostname's channel may move at all.
+     * Which channel a request for this hostname takes.
+     *
+     * Pinning is the caller's to apply, because it outranks the memory.
+     * Synchronous and pure by contract: the dispatcher asks once per request, and
+     * asking must not advance the host's channel. The loopback/LAN exemption is
+     * applied by the dispatcher itself, on top of whatever this returns.
+     */
+    channelFor(hostname: string): RouteChannel;
+    /**
+     * Whether this hostname's outcome may move its channel memory.
      *
      * A pinned host is always proxied and a loopback/LAN name is always direct, so
-     * neither has a cursor to move; only the hosts in between are observed.
+     * neither has a channel to decide; only the hosts in between are observed.
      */
-    rotateFor?(hostname: string): boolean;
+    learnFor?(hostname: string): boolean;
     /**
      * Where each dispatched request's outcome is reported.
      *
      * The dispatcher is the layer that serves callers which captured `fetch`
-     * before this plugin mounted, so it has to move the same cursor the wrapped
-     * path moves — otherwise those callers retry on one channel forever.
+     * before this plugin mounted, so it has to move the same memory the wrapped
+     * path moves — otherwise those callers keep landing on a channel that just
+     * failed.
      */
     onOutcome?(record: DispatchRecord): void;
 }

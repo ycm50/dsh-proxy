@@ -2,9 +2,9 @@
 
 给 DeepSeek Harness（DSH）加代理能力，**不改任何 DSH 官方代码**。它要解决的问题不是「把请求塞进代理」，而是**按域名决定每条请求走哪条通道，并让反复出现的握手成本从首字里消失**：
 
-- **一条名单，加一条轮换规则**：写进「强制走代理的域名」的域名（及其子域名）**永远走代理**；其它域名**第一次尝试直连，之后每一次尝试都换到另一条通道**——一次直连、一次代理、一次直连、一次代理——所以一条通道整条坏掉时，另一条会把它扛过去，而不是让整轮请求全灭。
+- **一条名单，加一条定格规则**：写进「强制走代理的域名」的域名（及其子域名）**永远走代理**；其它域名**先直连，1 秒内不通才换代理**，代理 1 秒也不通就回直连兜底——**哪条通道先答上，这个域名在本会话就定格在哪条通道**，不再来回换。
 - **每次尝试都记录**：哪条通道、第几次尝试、成功还是失败、失败码、耗时，逐条写进日志（见「诊断」）。「哪条通道坏了」是记录下来的事实，不靠猜。
-- **成功也换**：轮换是轮转，不是判决——上一次成功不代表下一次还走这条。两条通道因此都被持续使用与检验；代价是大约一半的请求会经代理（比纯直连多 0.2–1 秒，隧道复用时更少）。
+- **通就定格，不轮换**：一个域名的通道由它自己的请求选出来，成功不会把下一请求推给另一条通道；只有定格的那条之后真失败，才给另一条一次机会（见「选路策略」）。
 - **回环与内网/LAN 段是内置豁免**，任何配置都改不动：本地服务永远不出机器。
 - **连接复用 120 秒**：一次对话的多轮消息落在同一条（代理）隧道上，握手不再出现在每一轮的首字里。
 - **逐请求计时（可选）**：`DSH_PROXY_DEBUG=1` 打开后，每次请求都记下走的是哪条通道、连接是新建还是复用、等到响应头与首个 SSE 分片各花了多久。
@@ -16,7 +16,7 @@
 | 观察 | 实测 | 插件的对策 |
 | --- | --- | --- |
 | 新建一条代理隧道 | **1.3–1.9 s**（大头是 `CONNECT` 隧道里那次 TLS 握手） | 连接复用窗口 **120 s**：同一会话第 2 轮起降到 **0.2–0.3 s** |
-| 直连抖动 | 中位 **1.0 s**，但约每三次就有一次飙到 **3.7–5.0 s** | 重试轮换：直连失败就换代理重试，代理失败再换回直连，一条通道坏掉不再吃掉整轮请求 |
+| 直连抖动 | 中位 **1.0 s**，但约每三次就有一次飙到 **3.7–5.0 s** | 直连 1 秒内不通就换代理；通了就定格在直连，不再每条请求重新赌一次 |
 | 能连但被限速 | 某镜像直连 **30 s**、经代理 **2 s** | 强制名单：钉死走代理，不试直连 |
 | 首字构成 | 握手 + 边缘/服务端排队 + 模型思考 | 只回收前两项；第三项不是网络问题，观测层把三者分开 |
 
@@ -26,7 +26,7 @@
 
 | 插件版本 | 需要的 DSH |
 | --- | --- |
-| **0.7.0** | **≥ 0.2.0-rc.1**（策略换成「强制名单 + 重试轮换」：**去掉了「自动选路的域名」「排除域名」和「通道选择」三个设置组**，未列出的域名改为第一次直连、失败即换通道重试，并逐次记录；代理地址、系统代理、子进程导出、超时与重试参数不变） |
+| **0.7.0** | **≥ 0.2.0-rc.1**（选路为「**强制名单 + 先直连、1 秒探测、通就定格**」：强制名单永远走代理；其余域名先直连，1 秒内不通换代理，代理 1 秒也不通回直连兜底，答上的通道本会话保留；**任何失败都会推进选择**，不会把域名卡在刚失败的通道上。0.7.0 早期构建是「逐次轮换」，已废弃） |
 | **0.6.1** | **≥ 0.2.0-rc.1**（新增「强制走代理的域名」：命中即钉死走代理，不测量、不回落，用于「能直连但被限速」的站点；设置页拆成连接 / 域名名单 / 通道选择 / 请求稳定性四组） |
 | **0.6.0** | **≥ 0.2.0-rc.1**（名单内的域名改为「直连优先、变慢走代理」：新增「通道选择」三个设置项；直连失败且确定未送达时，同一请求就地改走代理重发一次；`route=auto` 是新的默认值，关掉它即恢复 0.5.x 的静态规则） |
 | **0.5.1** | **≥ 0.2.0-rc.1**（连接复用窗口 10 s → 120 s，一条会话不再每条消息重打一次隧道；`connectTimeoutMs` 现在真的作用到代理 `CONNECT` 隧道里的 TLS 握手，此前 `ProxyAgent` 忽略它、仍是 10 s 默认；happy-eyeballs 探测间隔 2500 ms → Node 默认 250 ms；新增 `DSH_PROXY_DEBUG` 请求计时，见「诊断」） |
@@ -73,34 +73,41 @@ dsh plugin --profile <profile名> add dsh-proxy@file:/绝对路径/dsh-proxy-0.3
 | 使用系统代理 | 勾选后**立即**读取本机代理设置并填入「代理地址」；勾选期间优先使用系统代理（见下） |
 | 插件安装/更新也走代理 | 默认关闭。打开后把代理写进**子进程环境变量**，让 `dsh plugin` 调用 pnpm / git 安装或更新插件时也走代理；**仅在「代理地址」是 http/https 时生效**（见「限制」） |
 | 记录尝试日志到文件 | **默认关闭**。打开后，每次尝试与每次挂载/重建/卸载都追加到 `<DSH_HOME>/dsh-proxy.log`（见「诊断」）；**下一次请求即生效，不用重启**。需要抓问题时打开，抓完关掉 |
-| 强制走代理的域名 | **唯一的名单**：命中的域名及其子域名**永远走代理**，不试直连、不参与轮换、不受任何失败影响。适合「直连能通但被限速到没有意义」的站点（实测某镜像直连 30 秒、经代理 2 秒就是这类）。**留空 = 没有钉死的域名**，所有域名都走下面的轮换规则。逗号分隔，支持域名 / 域名:端口 / URL / `.域名` 后缀 |
+| 强制走代理的域名 | **唯一的名单**：命中的域名及其子域名**永远走代理**，不探测、不换道、不受任何失败影响。适合「直连能通但被限速到没有意义」的站点（实测某镜像直连 30 秒、经代理 2 秒就是这类）。**留空 = 没有钉死的域名**，所有域名都走下面的选路规则。逗号分隔，支持域名 / 域名:端口 / URL / `.域名` 后缀 |
 | 建连超时（毫秒） | 默认 `60000`。TCP 建连、以及代理 `CONNECT` 隧道建立（含隧道内那次 TLS 握手）的上限。**别低于 30000**：本机实测代理握手最慢 10.5 秒，undici 默认的 10 秒会把它变成 `UND_ERR_CONNECT_TIMEOUT`。0.5.1 起这个值经 `proxyTls` / `requestTls` 真正作用到隧道上（此前 `ProxyAgent` 忽略它） |
 | 等待响应头超时（毫秒） | 默认 `300000`，`0` = 不限制 |
 | 流空闲超时（毫秒） | 默认 `0`（不限制）：流式传输中两个分片之间的间隔不设上限，慢模型不会被本插件掐断（DSH 自己另有流看门狗） |
-| 连接重试次数 | 默认 `3`，`0` = 关闭。**它同时是轮换的次数**：3 表示一次请求最多 4 次尝试（第 1 次直连，之后每次换通道）。只重试**连接级**失败，且仅当请求体可重放；指数退避 + 抖动，可用「停止」立刻打断 |
+| 连接重试次数 | 默认 `3`，`0` = 关闭。**它管的是已定格通道失效后的重试**：选路本身（直连探测 → 代理探测 → 直连兜底）最多 3 次尝试，不计入这个次数；3 表示定格之后再失败最多 4 次尝试。只重试**连接级**失败，且仅当请求体可重放；指数退避 + 抖动，可用「停止」立刻打断 |
 | 重试退避基数（毫秒） | 默认 `400`，每次翻倍 |
 | 「可能已送达」也重试 | 默认开。对「请求可能已到达服务端之后连接被重置」也重试；若重复一次请求会产生费用，可关掉（关掉后只重试确定未送达的失败） |
 
-### 重试策略：一次直连、一次代理
+### 选路策略：先直连，1 秒不通再代理，通就定格
 
-没有「自动选路的域名」也没有「排除域名」了：**除了强制名单里的域名，其它域名都走同一条规则**。
+没有「自动选路的域名」也没有「排除域名」：**除了强制名单里的域名，其它域名都走同一条规则**。
 
 | 情形 | 走哪条通道 |
 | --- | --- |
 | 强制名单命中 | **代理**，每次都代理，失败也在代理上重试，不换通道 |
 | 回环 / 内网 / LAN（`localhost`、`127.0.0.0/8`、`::1`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、IPv6 `fc00::/7` 与 `fe80::/10`、`.local` / `.lan` / `.internal` / `.home.arpa`） | **直连**，永远不出机器，也不换通道 |
-| 其它域名 | **第 1 次尝试直连**，之后**每一次尝试**都换到另一条通道（成功也换）；一直交替到用满「连接重试次数」 |
+| 其它域名，第一次请求 | **直连**，预算 **1000 ms**（`PROBE_TIMEOUT_MS`）：1 秒内拿到响应头 → 定格直连 |
+| 直连 1 秒没通 | **代理**，同样 1000 ms：拿到响应头 → 定格代理 |
+| 代理 1 秒也没通 | 回到**直连兜底一次**（不限时）：成功 → 定格直连；再失败 → 忘掉这个域名，下条请求重新选 |
+| 已定格的通道某次直接失败 | 换另一条通道探测一次（1000 ms）：通 → 改定格；不通 → 回直连兜底一次 |
+| 已定格的通道只是慢 | **不换**（本版的核心：慢 ≠ 失败） |
 
 规则细节：
 
-- **成功也换**：一次尝试结束就换通道，不因为「上一次成功了」而留在原地。所以一个健康的域名也是一次直连、一次代理地轮换——这是刻意的：两条通道都要被持续使用，才不会出现「一直走直连，直连坏掉时才知道」。
-- **轮换跟着域名走**：某个域名上一次失败在代理上，它**下一条请求**就从代理开始；两条通道都坏就一直交替。所以「一次直连、一次代理」既是同一条请求内部的重试顺序，也是这个域名后续请求的起点。
-- **两层拦截都参与轮换**：包 `globalThis.fetch` 的那一层（自带 dispatcher 的调用方）和进程级 dispatcher 那一层（早就捕获了 `fetch` 的调用方，例如 pi-ai）都会在每次尝试后推动同一个游标——两层只推动、不各自记账，所以同一个域名不会因为走了哪一层而有两套状态。
-- **换通道 ≠ 重试**：换通道是每一次尝试都发生的事；「重试」仍然只针对连接级失败——请求体不可重放、调用方按了「停止」、以及 HTTP 状态码（那是响应，不是传输失败）都不重试。默认连「可能已送达」的重置（`ECONNRESET` 等）也重试——关掉「可能已送达也重试」就只重试确定没送出去的那一类。
-- **每次尝试都记录**：`hostname attempt 2/4 via proxy -> failed ECONNRESET in 31ms (retrying on the other channel)`。日志在哪里看，见「诊断」。
-- 想回到「某站点一律走代理」，就写进**强制名单**；想让它「绝不走代理」，目前只有回环/内网那套内置豁免——这一版刻意不再提供「排除域名」。
+- **本会话定格**：记忆按域名记在本进程里，新会话（`session/created`）清空，所以**每个会话的第一条请求必然走直连**（强制名单除外）。
+- **1 秒只看响应头**：`fetch` 拿到 headers 就算通；之后 SSE 流式正文不受这个预算限制。超时的那次尝试会被 abort，然后用另一条通道重发——所以**它可能已经送达服务端**，对可能重复计费的接口请写进强制名单。1000 ms 是 `src/routing.ts` 里的 `PROBE_TIMEOUT_MS` 常量。
+- **什么算「没通」**：1 秒超时，或**任何其他失败**——连接被拒、DNS 解析失败、代理隧道被拒……HTTP 状态码是响应，不是失败。
+- **失败一定推进**：只要不是调用方取消、且请求体可以重放，一次失败就会把该域名的选择推进到下一步（直连探测失败 → 代理探测 → 直连兜底；已定格的通道失败 → 探测另一条）。推进本身不发请求，所以**绝不会把域名卡在刚失败的通道上**——上一条请求的失败，下一条请求不会再从同一条死路开始。
+- **无传输码的失败**（例如代理对 `CONNECT` 回非 200，undici 只给出 `fetch failed`）：「可能已送达也重试」开着（默认）时按可能已送达处理，换道重发；关掉时本次请求到此为止，但选择照样推进，下条请求从另一条通道开始。
+- **不重放就不换道**：请求体不可重放（流式 body）时既不设 1 秒预算也不换道，避免把请求截断或重发两次。
+- **两层拦截共享同一份记忆**：包 `globalThis.fetch` 的那一层和进程级 dispatcher 那一层读写同一个按域名的记忆，所以同一个域名不会因为走了哪一层而有两套状态；dispatcher 层没有 1 秒计时器，只做「成功定格 / 失败换道」。
+- **每次尝试都记录**：`api.opencode.ai attempt 1/4 via direct -> ok in 860ms (probe passed, direct kept for this host)`；失败且没有错误码时把错误原文带上：`... attempt 2/4 via proxy -> failed (fetch failed) in 4ms (next attempt via direct)`；调用方取消记为 `cancelled by the caller`。日志在哪里看，见「诊断」。
+- 想回到「某站点一律走代理」，就写进**强制名单**；想让它「绝不走代理」，目前只有回环/内网那套内置豁免。
 
-也可以只设环境变量，等价于「代理地址」（走不走代理仍由强制名单与轮换规则决定）：
+也可以只设环境变量，等价于「代理地址」（走不走代理仍由强制名单与选路规则决定）：
 
 ```powershell
 $env:DSH_HTTP_PROXY = 'socks5://127.0.0.1:7890'
@@ -138,16 +145,23 @@ dsh-proxy: 20 recent requests — proxy 12x (fresh 9) headers p50=1500ms p95=320
 
 #### 尝试记录：开关 + `~/.dsh/dsh-proxy.log`
 
-轮换的每一次尝试本来就走 host 日志，但桌面版的 host 日志没有落盘的地方，出问题时看不到。所以设置页「连接」组里有一个**开关**：**默认关闭**，需要抓的时候打开，同一次运行的下一个请求就会被记下来（字段是 volatile，不用重启）；抓完关掉即可。打开后写入（超过 4 MB 滚动成 `.1`）：
+选路的每一次尝试本来就走 host 日志，但桌面版的 host 日志没有落盘的地方，出问题时看不到。所以设置页「连接」组里有一个**开关**：**默认关闭**，需要抓的时候打开，同一次运行的下一个请求就会被记下来（字段是 volatile，不用重启）；抓完关掉即可。打开后写入（超过 4 MB 滚动成 `.1`）：
 
 ```
 dsh-proxy: record on — appending to C:\Users\you\.dsh\dsh-proxy.log
-dsh-proxy: routing generation installed — proxy=http://127.0.0.1:10808 forced=2 retry=3x400ms rotate=route=rotate (…)
-dsh-proxy: api.opencode.ai attempt 1/4 via direct -> failed ECONNREFUSED in 31ms (next attempt takes the other channel)
-dsh-proxy: api.opencode.ai attempt 2/4 via proxy -> ok in 412ms (next attempt takes the other channel)
-dsh-proxy: api.opencode.ai via direct (dispatcher) -> ok in 388ms (next via proxy)
+dsh-proxy: routing generation installed — proxy=http://127.0.0.1:10808 forced=2 retry=3x400ms route=sticky (direct first with a 1000ms probe, …)
+dsh-proxy: api.opencode.ai attempt 1/4 via direct -> ok in 860ms (probe passed, direct kept for this host)
+dsh-proxy: api.deepseek.com attempt 1/4 via direct -> failed PROBE_TIMEOUT in 1001ms (next attempt via proxy)
+dsh-proxy: api.deepseek.com attempt 2/4 via proxy -> failed (fetch failed) in 4ms (next attempt via direct)
+dsh-proxy: api.deepseek.com attempt 3/4 via direct -> ok in 1511ms (kept on direct)
+dsh-proxy: api.deepseek.com attempt 1/4 via direct -> ok in 210ms (kept on direct)
+dsh-proxy: api.deepseek.com attempt 2/4 via direct -> failed UND_ERR_ABORTED in 42ms (cancelled by the caller)
 dsh-proxy: routing deactivated (the wrapper and the dispatcher are being retired)
 ```
+
+- `PROBE_TIMEOUT`：探测预算用完（本插件自己的判定，1 秒内没拿到响应头）。
+- `failed (fetch failed)`：失败没有传输码时括号里是错误原文——代理隧道被拒通常就是这种形态；这类失败同样会推进选择，不会把域名卡住。
+- `UND_ERR_ABORTED ... (cancelled by the caller)`：调用方取消（按了停止、或进程退出），不是通道的判决，不换道。
 
 位置是 `<DSH_HOME>/dsh-proxy.log`（默认 `~/.dsh/dsh-proxy.log`）。`DSH_PROXY_LOG` 可以指定别的路径，**并且它本身就是开关**——设了非空值就等于打开，适合抓"还没走到设置页"的启动阶段（挂载时读一次）。
 
@@ -238,7 +252,7 @@ dsh --profile <profile名>     # 重启生效
 
 - 按域名整棵树路由，所以共享域名（如 `chatgpt.com`）下其它用途的请求也会一并被代理。
 - 插件**自带一份 undici**，它的 `Request` 类与平台 `fetch` 给出的 `Request` **不是同一个类**。所以调用方传进来的 `Request` 会被拆开（URL / method / headers / body / signal 等重组成一个普通 init）再交给自带 undici；不这么做，undici 会把它 `String()` 成 `"[object Request]"`，然后以 `ERR_INVALID_URL` **在毫秒内、不发任何字节地失败**（两条通道都一样，看起来像"怎么都连不上"）。
-- 轮换意味着**未列出的域名也可能出现在代理日志里**：只要它直连失败过一次，下一次尝试就会走代理。不想让某个域名有这个可能，就把它钉在直连侧——这一版没有这个开关，唯一的内置保证是回环与内网段永远直连。
+- 选路意味着**未列出的域名可能出现在代理日志里**：直连 1 秒没通或连接失败过一次，它就会换到代理并定格。不想让某个域名有这个可能，目前只有回环/内网那套内置豁免——这一版刻意不再提供「排除域名」。
 - **子进程只看 `NO_PROXY`，看不到强制名单**：pnpm / git 拿到的是全局的 `HTTP_PROXY` / `HTTPS_PROXY`，`NO_PROXY` 里只有回环和你机器原有的条目。也就是说子进程里的域名一律走代理——包括强制名单里的那些（那正是「插件安装/更新也走代理」的意义）。
 - `transport: websocket` 的流式传输、以及 amazon-bedrock 等走厂商原生 SDK 的请求不经 `fetch`，本插件管不到。
 - 代理认证只能内嵌在 URL 中（`http://user:pass@host:port`）。
@@ -251,7 +265,7 @@ dsh --profile <profile名>     # 重启生效
 ```bash
 pnpm install
 pnpm typecheck   # 对着真实的 DSH 类型声明检查
-pnpm test        # 不联网：自清理（profile 补丁）+ volatile 配置契约 + 稳定性契约 + 通道轮换
+pnpm test        # 不联网：自清理（profile 补丁）+ volatile 配置契约 + 稳定性契约 + 定格选路
                  #        + 路由判定与豁免 + 连接级重试 + 多实例装卸 + 请求计时 + 系统代理解析 + 设置页渲染
 pnpm build       # 生成 lib/，需一并提交
 pnpm pack        # 生成 dsh-proxy-<version>.tgz，可用 file: 路径直接装
@@ -259,16 +273,16 @@ pnpm pack        # 生成 dsh-proxy-<version>.tgz，可用 file: 路径直接装
 
 测试清单见 [TESTING.md](TESTING.md)：说「全局测试」时按那份列表逐项跑，说「更新测试列表」时才改它；日常只改了什么就只跑对应那几项。
 
-版本库约定（对应 `.gitignore`）：`lib/**` —— 包括 `lib/index.js`、`lib/profile-patch.js`、`lib/client.js`、`lib/client.js.map` 与 `lib/types/**` —— **故意提交**，这样从 GitHub 或 tarball 安装都不需要构建步骤；`node_modules/`、`dist/`、`build/`、`out/`、`coverage/`、`*.tsbuildinfo`、`*.tgz`、`*.log`、`*.prune.tmp`、`.env*`、编辑器目录（`.vscode/`、`.idea/`）与 `.pnpm-store/` 都在忽略之列。**改了源码必须 `pnpm build` 并把 `lib/**` 一起提交**，否则装进 DSH 的还是旧代码（本次 0.7.0 就是源码与 `lib/` 同一次提交）。
+版本库约定（对应 `.gitignore`）：`lib/**` —— 包括 `lib/index.js`、`lib/profile-patch.js`、`lib/client.js`、`lib/client.js.map` 与 `lib/types/**` —— **故意提交**，这样从 GitHub 或 tarball 安装都不需要构建步骤；`node_modules/`、`dist/`、`build/`、`out/`、`coverage/`、`*.tsbuildinfo`、`*.tgz`、`*.log`、`*.prune.tmp`、`.env*`、编辑器目录（`.vscode/`、`.idea/`）与 `.pnpm-store/` 都在忽略之列。**改了源码必须 `pnpm build` 并把 `lib/**` 一起提交**，否则装进 DSH 的还是旧代码（本次修正就是源码与 `lib/` 同一次提交）。
 
 `pnpm build` 是双 entry：`lib/index.js`（host 半）与 `lib/profile-patch.js`（自清理，单独成文件是为了能脱离 undici / schemastery 单独测试）。`lib/client.js` 与 `lib/types/**` 也要一起提交。
 
-host 半的模块划分：`index.ts`（生命周期与两层装卸）、`dispatch.ts`（进程级 dispatcher：按 hostname 分流、豁免判定、多实例安装栈）、`proxy.ts`（两条通道的构建，以及**轮换重试的请求路径**：第 1 次直连、失败换通道、每次尝试都上报）、`routing.ts`（每个域名的通道游标：失败翻面、成功不动）、`stability.ts`（超时/重试参数、范围钳制、undici 选项与两条通道共用的 connector 形状）、`retry.ts`（哪些失败可重试、可重放判定、退避与可打断的等待）、`observe.ts`（`DSH_PROXY_DEBUG` 下的每请求计时与复用归属）、`config.ts`（volatile 配置与防御式读取）、`hosts.ts`（域名整树匹配与回环/内网豁免）、`system-proxy.ts` 与 `profile-patch.ts` 各司其职。
+host 半的模块划分：`index.ts`（生命周期与两层装卸）、`dispatch.ts`（进程级 dispatcher：按 hostname 分流、豁免判定、多实例安装栈）、`proxy.ts`（两条通道的构建，以及**选路的请求路径**：先直连、1000 ms 探测、失败才换道、每次尝试都上报）、`routing.ts`（每个域名的通道记忆：探测、定格、失败才换一次）、`stability.ts`（超时/重试参数、范围钳制、undici 选项与两条通道共用的 connector 形状）、`retry.ts`（哪些失败可重试、可重放判定、退避与可打断的等待）、`observe.ts`（`DSH_PROXY_DEBUG` 下的每请求计时与复用归属）、`config.ts`（volatile 配置与防御式读取）、`hosts.ts`（域名整树匹配与回环/内网豁免）、`system-proxy.ts` 与 `profile-patch.ts` 各司其职。
 
 `test/profile-patch-test.mjs`（profile 行的改写：删除 / 只清 `config` / 读取 `disabled` 与 bundle 选择）、`test/unload-cleanup-test.mjs`（把一个临时 profile 喂给 `apply`，再拆掉 fiber，看它到底改了什么）与 `test/system-proxy-test.mjs`（系统代理的解析：Windows 注册表输出、`ProxyServer` 两种写法、`scutil`、GSettings、环境变量兜底与平台回退）都不联网、不碰真实 profile 与注册表，可以单独跑：`node test/profile-patch-test.mjs` / `node test/unload-cleanup-test.mjs` / `node test/system-proxy-test.mjs`。
 `test/routing-dispatcher-test.mjs`（分流与豁免：强制名单命中→代理通道、未命中→加固直连、回环与内网段（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`fc00::/7`、`fe80::/10`、`.local` 等）永不代理、畸形 origin 一律 fail-open 走直连、`close` / `destroy` 是否收掉两条通道、多实例安装栈与「第三方替换后我们不回收」）与 `test/retry-test.mjs`（哪些失败可重试、`retryOnPossibleDelivery` 的开关语义、不可重放的请求体只发一次、调用方 abort 立刻打断退避、`maxRetries: 0` 时函数恒等）都不联网、不需要代理。
-`test/routing-fetch-test.mjs`（轮换重试：第 1 次必直连、失败后逐次换通道、成功即停、强制名单不轮换、回环/内网永不离开机器、重试门槛（不可重放 / 已取消 / HTTP 状态 / 未知错误码）与每次尝试的记录）与
-`test/routing-selector-test.mjs`（通道轮换：未动过的域名从直连开始、失败才翻面、成功原地不动、游标按域名各记各的、连续失败读作直连/代理交替、`reset` 全部回到直连）与 `test/observe-test.mjs`（请求计时：开关语义、`Response` 原样返回、SSE 首片归属、新建/复用归属、汇总与 `dispose`）同样不联网。
+`test/routing-fetch-test.mjs`（定格选路：第 1 次必直连、1 秒探测超时换代理、两条都不通回直连兜底、答上即定格、下一次请求不再换道、强制名单不探测、回环/内网永不离开机器、重试门槛（不可重放 / 已取消 / HTTP 状态 / 未知错误码）与每次尝试的记录）与
+`test/routing-selector-test.mjs`（通道记忆：未动过的域名从直连开始、探测失败才换、答上即定格、已定格通道失败只换一次、健康域名不再轮换、记忆按域名各记各的、`reset` 全部回到直连）与 `test/observe-test.mjs`（请求计时：开关语义、`Response` 原样返回、SSE 首片归属、新建/复用归属、汇总与 `dispose`）同样不联网。
 `test/proxy-*.mjs` 与 `test/latency-bench.mjs` 需要网络和一个可用代理，不参与 `pnpm test`。
 客户端用例会给 `*.module.css`、`clsx`、`simple-icons`、`shiki`、`@deepseek-ai/dsh-client-store` 这些由 DSH 外壳打包提供的依赖打桩（见 `test/primitives-hook.mjs`），其余都是真代码。
 

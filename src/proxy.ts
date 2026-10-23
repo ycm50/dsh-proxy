@@ -3,11 +3,12 @@
  *
  * The plugin does not touch DeepSeek Harness source. It installs a wrapper
  * around `globalThis.fetch` — which both the DeepSeek adapter's raw `fetch` and
- * the pi-ai SDK clients call — and routes model-API hosts through a proxy
- * dispatcher, leaving every other host on this plugin's own **hardened direct**
- * channel. Only the hosts the configuration names are routed; `excludeHosts`
- * always stays direct, and loopback and private networks are exempt on top of
- * that (see {@link isExemptHostname}).
+ * the pi-ai SDK clients call — and decides, per host, whether a request takes the
+ * proxy or this plugin's own **hardened direct** channel. Hosts on the force list
+ * always take the proxy; every other host starts direct and only moves onto the
+ * proxy when direct does not answer in time or fails outright (see
+ * {@link RouteMemory}). Loopback and private networks are exempt throughout (see
+ * {@link isExemptHostname}).
  *
  * Both channels are built from the same hardened options (see
  * `dsh-proxy/stability`): a long connect ceiling, TCP keepalive, a bounded
@@ -33,7 +34,8 @@ import {
 } from './retry.js'
 import type { RetryAttempt } from './retry.js'
 import type { ProxyObserver } from './observe.js'
-import type { ChannelRotation, RouteAttempt, RouteChannel } from './routing.js'
+import { PROBE_TIMEOUT_CODE, PROBE_TIMEOUT_MS } from './routing.js'
+import type { RouteAttempt, RouteChannel, RouteDecision, RouteMemory } from './routing.js'
 
 export {
   DEFAULT_DEEPSEEK_HOST,
@@ -114,11 +116,12 @@ export function isExemptHostname(hostname: string): boolean {
 /**
  * Whether a hostname is pinned to the proxy by the force list.
  *
- * The force list is the one list left: a host named there always travels through
- * the proxy, and it is the answer for a site that *can* be reached directly but
- * is throttled hard enough that trying is pointless — a mirror that answers in
- * 30 s direct and in 2 s through the proxy. A pinned host never alternates
- * channels (see `dsh-proxy/routing`): there is no direct attempt to rotate to.
+ * The force list is the one list there is: a host named there always travels
+ * through the proxy, and it is the answer for a site that *can* be reached
+ * directly but is throttled hard enough that trying is pointless — a mirror that
+ * answers in 30 s direct and in 2 s through the proxy. A pinned host never
+ * probes and never moves (see `dsh-proxy/routing`): there is no direct attempt to
+ * compare against.
  *
  * The built-in exemption still outranks it: loopback and private networks never
  * travel at all, whatever the list says.
@@ -241,7 +244,8 @@ export interface NormalisedCall {
  *
  * So a foreign request is taken apart instead of forwarded: its URL, method,
  * headers, body and the rest are copied into a plain init the bundled undici can
- * read. A `Request` this plugin built itself is passed through untouched.
+ * read. The body is copied as bytes, never as decoded text. A `Request` this
+ * plugin built itself is passed through untouched.
  * @param input - the fetch input.
  * @param init - the fetch init, if any.
  * @returns the input and init to call the bundled fetch with.
@@ -272,9 +276,15 @@ export async function normaliseFetchCall(
     }
   }
   if (next.signal === undefined && request.signal !== null) next.signal = request.signal
-  // A Request built from a string exposes a stream; the bundled undici cannot
-  // take a stream from the other undici, so the text is read back out of it.
-  if (next.body === undefined && request.body !== null) next.body = await request.text()
+  // A Request exposes a stream; the bundled undici cannot take a stream from the
+  // other undici, so the body is read back out of it. Read it as bytes: `text()`
+  // decodes UTF-8, so every non-text body (recorded audio, uploads, archives)
+  // came out with its invalid bytes replaced by U+FFFD and grew on the wire.
+  if (next.body === undefined && request.body !== null) {
+    next.body = typeof request.arrayBuffer === 'function'
+      ? await request.arrayBuffer()
+      : await request.text()
+  }
   return { input: request.url, init: next }
 }
 
@@ -354,7 +364,7 @@ export function createProxyFetch(proxyUrl: string): ProxyFetch {
   return { fetch: channel.fetch, close: channel.close }
 }
 
-/** The two fetch shapes the routing layer alternates between. */
+/** The two fetch shapes the routing layer chooses between. */
 export interface RoutingChannels {
   /** The hardened proxy channel. */
   proxy: typeof fetch
@@ -380,11 +390,19 @@ export interface RoutingOptions {
   /** Whether a failure that may already have been delivered is retried too. */
   retryOnPossibleDelivery: boolean
   /**
+   * How long an unproven channel gets to answer, in milliseconds.
+   *
+   * Absent takes {@link PROBE_TIMEOUT_MS}. The budget applies only while a host's
+   * channel is still being decided (see `dsh-proxy/routing`); a host that has
+   * already been settled is never cut off by it.
+   */
+  probeTimeoutMs?: number
+  /**
    * Whether the configuration pins this hostname to the proxy.
    *
-   * A pinned host has no direct path to rotate to, so it makes every attempt on
-   * the proxy; the built-in loopback/LAN exemption is applied here too, so a
-   * pinned name can never be made to leave the machine.
+   * A pinned host has no direct path and therefore nothing to probe; the built-in
+   * loopback/LAN exemption is applied here too, so a pinned name can never be
+   * made to leave the machine.
    */
   forcedProxy?(hostname: string): boolean
   /** Called once per finished attempt: the record the user asked for. */
@@ -394,7 +412,109 @@ export interface RoutingOptions {
 }
 
 /**
- * Wrap the two channels so every request alternates between them on its retries.
+ * How many attempts a host may spend on *choosing* its channel.
+ *
+ * The memory's decision sequence is at most direct probe → proxy probe → direct
+ * fallback, so three attempts always cover it. Those attempts are the routing
+ * decision, not repeats of a channel that already answered, which is why they are
+ * allowed even when `retryCount` is 0.
+ */
+const PROBE_ATTEMPTS = 3
+
+/** A merged abort signal plus the cleanup its fallback path needs. */
+interface MergedSignal {
+  /** The signal the attempt hands to its channel. */
+  signal: AbortSignal
+  /** Detach the fallback listener, if one was installed. */
+  release(): void
+}
+
+/**
+ * Merge a caller's abort signal into the one a bounded attempt hands to its
+ * channel, so Stop still cancels a probe immediately.
+ *
+ * `AbortSignal.any` is the platform answer and needs no cleanup. The manual
+ * fallback exists for a runtime that predates it; it keeps one listener on the
+ * caller's signal and removes it when the attempt ends.
+ * @param caller - the caller's signal, if any.
+ * @param controller - the controller that owns this attempt's deadline.
+ * @returns the signal to pass on, plus its cleanup.
+ */
+function mergeSignal(
+  caller: AbortSignal | null | undefined,
+  controller: AbortController,
+): MergedSignal {
+  if (caller === null || caller === undefined) {
+    return { signal: controller.signal, release: () => { /* nothing to detach */ } }
+  }
+  const any = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
+  if (typeof any === 'function') {
+    return { signal: any.call(AbortSignal, [caller, controller.signal]), release: () => { /* GC'd with the signal */ } }
+  }
+  if (caller.aborted) {
+    controller.abort(caller.reason)
+    return { signal: controller.signal, release: () => { /* already aborted */ } }
+  }
+  const forward = (): void => controller.abort(caller.reason)
+  caller.addEventListener('abort', forward, { once: true })
+  return {
+    signal: controller.signal,
+    release: () => caller.removeEventListener('abort', forward),
+  }
+}
+
+/**
+ * Run one channel call, aborting it when the probe budget runs out.
+ *
+ * The budget is measured to the response headers, which is what "the channel
+ * answered" means for routing; a streaming body that arrives afterwards is not
+ * bounded by it. A budget of 0 means no deadline at all.
+ * @param impl - the channel fetch.
+ * @param input - the fetch input.
+ * @param init - the fetch init, if any.
+ * @param budgetMs - the deadline, in milliseconds; 0 disables it.
+ * @param caller - the caller's abort signal, if any.
+ * @returns the response, or a rejection carrying {@link PROBE_TIMEOUT_CODE}.
+ */
+async function attemptOnChannel(
+  impl: typeof fetch,
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  budgetMs: number,
+  caller: AbortSignal | null,
+): Promise<Response> {
+  if (budgetMs <= 0) return impl(input, init)
+  const controller = new AbortController()
+  const merged = mergeSignal(caller, controller)
+  const attemptInit: RequestInit = init === undefined
+    ? { signal: merged.signal }
+    : { ...init, signal: merged.signal }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = Object.assign(
+        new Error('dsh-proxy: no answer within ' + String(budgetMs) + 'ms'),
+        { code: PROBE_TIMEOUT_CODE },
+      )
+      reject(error)
+      controller.abort(error)
+    }, budgetMs)
+  })
+  const call = impl(input, attemptInit)
+  // The race owns this rejection; without a handler of its own the abandoned
+  // call would surface as an unhandled rejection.
+  void call.catch(() => { /* reported by the race */ })
+  try {
+    return await Promise.race([call, deadline])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    merged.release()
+  }
+}
+
+/**
+ * Wrap the two channels so each host is decided once and then kept on the
+ * channel that answered.
  *
  * The direct argument is deliberately the plugin's **hardened direct** fetch
  * rather than the platform fetch: a host the configuration does not name still
@@ -402,48 +522,75 @@ export interface RoutingOptions {
  * Falling back to the platform fetch would put it back on undici's 10 second
  * connect timeout, which is the failure this plugin exists to remove.
  *
- * The strategy is {@link ChannelRotation}'s: the first attempt of a host goes
- * direct, and **every** attempt after it takes the other channel — so a run of
- * retries reads direct, proxy, direct, proxy, and one broken path can never
- * consume a whole turn while the other one is healthy. The cursor moves on
- * success too, which is what keeps both paths in use instead of trusting one on
- * the strength of a single good minute. A pinned host skips the rotation.
+ * The strategy is {@link RouteMemory}'s, and it is what the user asked for: a
+ * host that is on no list starts direct with a {@link PROBE_TIMEOUT_MS} budget;
+ * answering settles it on direct for the session, and only a direct path that
+ * stays silent hands it to the proxy (same budget). The channel that answers is
+ * kept, so a healthy host never alternates, while a settled channel that then
+ * fails outright still gets one probe of the other. A pinned host skips all of
+ * it and stays on the proxy.
  *
- * Retrying is still gated the way the transport layer always gated it: the body
- * must be replayable, the caller must not have aborted, and the failure must
- * qualify — a possibly-delivered failure only when `retryOnPossibleDelivery` is
- * on, which is the same rule the single-channel retry applies. Once the budget is
- * spent the original error is rethrown unchanged, so the harness sees the
- * transport code it always saw.
+ * Retrying is gated by whether the request can be sent again: the body must be
+ * replayable and the caller must not have aborted. A failure that may already
+ * have been delivered is resent only when `retryOnPossibleDelivery` is on — and
+ * a failure carrying **no** transport code counts as possibly delivered, because
+ * that is the case where refusing to move would strand the host on a channel
+ * that does not work. What a failure never does is leave the host's decision
+ * where it was: the memory advances even when the request itself must stop.
+ * The probe sequence is the routing decision and is bounded by the memory to
+ * three attempts. Once there is nothing left to try the original error is
+ * rethrown unchanged, so the harness sees the transport code it always saw.
  * @param channels - the proxy fetch and the direct fetch.
- * @param rotation - the per-host channel rotation.
- * @param options - retry budget, pinning, and where attempts are recorded.
+ * @param memory - the per-host channel memory.
+ * @param options - retry budget, probe deadline, pinning, and where attempts are recorded.
  * @returns the routing fetch.
  */
 export function createRoutingFetch(
   channels: RoutingChannels,
-  rotation: ChannelRotation,
+  memory: RouteMemory,
   options: RoutingOptions,
 ): typeof fetch {
-  const maxAttempts = Math.max(1, 1 + (Number.isFinite(options.retryCount) ? Math.max(0, Math.trunc(options.retryCount)) : 0))
+  const retries = Number.isFinite(options.retryCount) ? Math.max(0, Math.trunc(options.retryCount)) : 0
+  const retryLimit = 1 + retries
+  const maxAttempts = Math.max(retryLimit, PROBE_ATTEMPTS)
+  const probeTimeoutMs = Number.isFinite(options.probeTimeoutMs) && (options.probeTimeoutMs as number) > 0
+    ? Math.trunc(options.probeTimeoutMs as number)
+    : PROBE_TIMEOUT_MS
   const forcedProxy = options.forcedProxy ?? (() => false)
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = urlOf(input as string | URL | Request)
+    // Read the call once, before any attempt. A caller-supplied `Request` is
+    // consumed when its body is read, so retrying with the same object would
+    // reject instantly with "Body is unusable" — a failure that carries no
+    // transport code and used to strand the host on the channel that just
+    // failed. Normalising once makes every attempt below send the same bytes.
+    const call = await normaliseFetchCall(input as string | URL | Request, init)
+    const requestInit = call.init
+    const url = urlOf(call.input)
     const hostname = hostnameOrEmpty(url)
-    const signal = init?.signal ?? null
+    const signal = requestInit?.signal ?? null
     // A loopback or LAN name never travels; a pinned host always does. Neither
-    // has a choice to rotate, so neither consults the rotation at all.
+    // has a channel to choose, so neither consults the memory.
     const exempt = hostname.length > 0 && isExemptHostname(hostname)
     const pinned = hostname.length > 0 && !exempt && forcedProxy(hostname)
-    const rotate = hostname.length > 0 && !exempt && !pinned
-    const replayable = isReplayableRequest(init)
+    const decided = hostname.length > 0 && !exempt && !pinned
+    const replayable = isReplayableRequest(requestInit)
 
     for (let attempt = 1; ; attempt++) {
-      const channel: RouteChannel = exempt ? 'direct' : pinned ? 'proxy' : rotation.channelFor(hostname)
+      const decision: RouteDecision = exempt
+        ? { channel: 'direct', probe: false, fallback: false }
+        : pinned
+          ? { channel: 'proxy', probe: false, fallback: false }
+          : memory.decide(hostname)
+      const channel = decision.channel
       const impl = channel === 'proxy' ? channels.proxy : channels.direct
+      // Only an unproven channel is bounded, and only when the request can be
+      // sent again: aborting a one-shot body to try the other channel would
+      // truncate it.
+      const budgetMs = decision.probe && replayable ? probeTimeoutMs : 0
       const startedAt = performance.now()
       try {
-        const response = await impl(input, init)
+        const response = await attemptOnChannel(impl, call.input, requestInit, budgetMs, signal)
+        if (decided) memory.settle(hostname, channel)
         options.onAttempt?.({
           hostname,
           attempt,
@@ -451,16 +598,46 @@ export function createRoutingFetch(
           channel,
           ok: true,
           ms: Math.round(performance.now() - startedAt),
+          probe: decision.probe,
+          next: channel,
         })
-        // The attempt is over, so the cursor moves: the next one takes the
-        // other channel whether this one answered or not.
-        if (rotate) rotation.record(hostname)
         return response
       } catch (error) {
         // A caller's cancel is not the channel's verdict: it is recorded as
-        // such, and it never moves the rotation.
+        // such, and it never moves the memory.
         const aborted = isAborted(signal)
         const code = aborted ? 'UND_ERR_ABORTED' : transportCodeOf(error)
+        const message = error instanceof Error ? error.message : String(error)
+        const timedOut = code === PROBE_TIMEOUT_CODE
+        // How much the failure says about delivery. A known "not delivered" code
+        // is safe to resend; a known "possibly delivered" one needs the switch;
+        // and a failure with no code at all is treated as possibly delivered —
+        // its whole point is that an unrecognised error must not freeze a host.
+        const notDelivered = isRetryableTransportError(error, false)
+        const possiblyDelivered = isRetryableTransportError(error, true) && !notDelivered
+        const resendable = timedOut || notDelivered
+          || (options.retryOnPossibleDelivery && (possiblyDelivered || code.length === 0))
+        let next: RouteDecision | undefined
+        let repeat = false
+        if (aborted || !replayable) {
+          // Nothing may be sent again: the failure is the caller's to see.
+        } else if (!decided) {
+          // A pinned or exempt host has no choice to make; it may still retry
+          // its own channel while the budget allows.
+          repeat = resendable && attempt < retryLimit
+        } else {
+          // The decision always moves on a failure. Advancing it sends nothing;
+          // leaving it put is what pinned a host to the channel that had just
+          // failed, so every later request opened with the same doomed probe.
+          next = memory.failed(hostname, channel)
+          if (next !== undefined) {
+            if (!resendable) next = undefined
+            // Every attempt of one request — including the probe sequence and
+            // the fallback — counts against the same budget, so two concurrent
+            // requests sharing the memory cannot walk the log past `n/n`.
+            else if (attempt >= maxAttempts) next = undefined
+          }
+        }
         options.onAttempt?.({
           hostname,
           attempt,
@@ -469,19 +646,22 @@ export function createRoutingFetch(
           ok: false,
           ms: Math.round(performance.now() - startedAt),
           code,
+          message,
+          probe: decision.probe,
+          ...(next === undefined && !repeat ? {} : { next: next?.channel ?? channel }),
         })
-        if (rotate) rotation.record(hostname)
-        const worthRetrying = attempt < maxAttempts
-          && replayable
-          && !aborted
-          && isRetryableTransportError(error, options.retryOnPossibleDelivery)
-        if (!worthRetrying) throw error
-        options.onRetry?.({
-          attempt,
-          maxRetries: maxAttempts - 1,
-          code,
-          url,
-        })
+        if (next === undefined && !repeat) throw error
+        // A probe that moves on is the routing decision, already explained by
+        // the attempt record; only a genuine re-dial of the same channel or a
+        // retry on a settled one is worth the transport-retry warning.
+        if (repeat || (next !== undefined && !next.probe && !next.fallback)) {
+          options.onRetry?.({
+            attempt,
+            maxRetries: Math.max(0, retryLimit - 1),
+            code,
+            url,
+          })
+        }
         await abortableSleep(retryDelayMs(options.baseDelayMs, attempt), signal)
         // The caller may have aborted during the sleep: surface the abort, not a stale retry.
         if (isAborted(signal)) throw error

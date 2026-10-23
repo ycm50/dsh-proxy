@@ -1,12 +1,13 @@
 // Offline test for the routing fetch: which channel each *attempt* takes, when
-// the rotation moves, and the exact conditions under which a failure is retried.
+// a host's choice is settled, and the exact conditions under which an attempt is
+// repeated or handed to the other channel.
 //
-// No network: both channels are fakes that record their calls, and the rotation
-// is inspected directly. The strategy under test is the shipped one — attempt 1
-// goes direct, a failure moves the host to the other channel, and the retry that
-// follows takes it — so a run of retries reads direct, proxy, direct, proxy.
+// No network: both channels are fakes that record their calls, and the probe
+// budget is shortened to 40 ms so a "silent" channel is one that never answers.
+// The strategy under test is the shipped one — attempt 1 goes direct and a host
+// that answers stays there; only silence or a failure moves it, once.
 import {
-  ChannelRotation,
+  RouteMemory,
   createRoutingFetch,
 } from '../lib/index.js'
 
@@ -23,118 +24,150 @@ const UNPINNED = 'https://api.opencode.ai/v1/chat/completions'
 const UNPINNED_HOST = 'api.opencode.ai'
 const PINNED = 'https://mirror.example/v1/chat'
 const LOOPBACK = 'http://127.0.0.1:9/v1/chat'
+const PROBE_MS = 40
 
 /** A transport failure as undici reports it: the code rides on `cause`. */
 const failure = (code) => Object.assign(new Error(code), { cause: Object.assign(new Error(code), { code }) })
 
-const ok = () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+const ok = (status = 200) => new Response('{}', { status, headers: { 'content-type': 'application/json' } })
+
+/** A channel that accepts the request and never answers it. */
+const silent = () => new Promise(() => {})
 
 /**
- * Two fake channels, a real rotation, and the records the wrapper produces.
+ * Two fake channels, a real memory, and the records the wrapper produces.
  *
  * `calls` is the channel of every attempt in order, so an assertion reads as the
- * sequence the user would see in the log.
+ * sequence the user would see in the log. Each channel fake receives the
+ * zero-based index of its own call, so a test can make only the first attempt
+ * silent.
  */
 function harness(options = {}) {
   const calls = []
+  const bodies = { proxy: [], direct: [] }
+  let proxyIndex = 0
+  let directIndex = 0
   const channels = {
-    proxy: async () => { calls.push('proxy'); return options.proxy?.() ?? ok() },
-    direct: async () => { calls.push('direct'); return options.direct?.() ?? ok() },
+    proxy: async (_input, init) => {
+      calls.push('proxy')
+      bodies.proxy.push(init?.body)
+      return (options.proxy ?? (() => ok()))(proxyIndex++)
+    },
+    direct: async (_input, init) => {
+      calls.push('direct')
+      bodies.direct.push(init?.body)
+      return (options.direct ?? (() => ok()))(directIndex++)
+    },
   }
-  const rotation = new ChannelRotation()
+  const memory = new RouteMemory()
   const attempts = []
   const retries = []
-  const fetchImpl = createRoutingFetch(channels, rotation, {
+  const fetchImpl = createRoutingFetch(channels, memory, {
     retryCount: options.retryCount ?? 3,
     baseDelayMs: options.baseDelayMs ?? 0,
     retryOnPossibleDelivery: options.retryOnPossibleDelivery !== false,
+    probeTimeoutMs: options.probeTimeoutMs ?? PROBE_MS,
     forcedProxy: options.forcedProxy,
     onAttempt: (attempt) => { attempts.push(attempt) },
     onRetry: (retry) => { retries.push(retry) },
   })
-  return { calls, rotation, attempts, retries, fetchImpl }
+  return { calls, bodies, memory, attempts, retries, fetchImpl }
 }
 
-// --- 1. The baseline: a healthy host goes direct, once ---------------------
+const state = (memory, host) => memory.stateOf(host) ?? '(none)'
+const DIRECT_KEPT = { channel: 'direct', probe: false, fallback: false }
+const PROXY_KEPT = { channel: 'proxy', probe: false, fallback: false }
+const PROBE_PROXY = { channel: 'proxy', probe: true, fallback: false }
+
+// --- 1. A healthy host goes direct, and stays there ------------------------
+// The regression this file exists for: this used to read direct, proxy, direct,
+// proxy — one request per channel, forever.
 {
-  const { calls, rotation, attempts, retries, fetchImpl } = harness()
+  const { calls, memory, attempts, retries, fetchImpl } = harness()
   const response = await fetchImpl(UNPINNED)
   check('a healthy request goes direct', calls, ['direct'])
   check('it answers the caller', response.status, 200)
   check('no retry happened', retries.length, 0)
   check('one attempt was recorded', attempts.length, 1)
   check('the record names the channel', attempts[0].channel, 'direct')
-  check('the record names the attempt', [attempts[0].attempt, attempts[0].maxAttempts], [1, 4])
-  check('the record says it worked', attempts[0].ok, true)
-  check('the record carries a duration', typeof attempts[0].ms, 'number')
-  // The attempt is over, so the cursor moved: the *next* request from this host
-  // takes the other channel.
-  check('an answered attempt still moves the cursor', rotation.stateOf(UNPINNED_HOST), 'proxy')
+  check('the record marks the probe', attempts[0].probe, true)
+  check('the record says the channel is kept', attempts[0].next, 'direct')
+  check('the answer settles the host on direct', state(memory, UNPINNED_HOST), DIRECT_KEPT)
+  await fetchImpl(UNPINNED)
+  check('the next request keeps using direct', calls, ['direct', 'direct'])
 }
 
-// --- 2. A failing host alternates channels on every retry ------------------
+// --- 2. Silent direct hands the host to the proxy, and the proxy is kept ----
 {
-  const { calls, rotation, attempts, retries, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') }, proxy: () => { throw failure('ECONNRESET') } })
+  const { calls, memory, fetchImpl } = harness({ direct: (n) => (n === 0 ? silent() : ok()) })
+  const response = await fetchImpl(UNPINNED)
+  check('a silent direct path moves to the proxy', calls, ['direct', 'proxy'])
+  check('the caller is answered', response.status, 200)
+  check('the proxy answer is kept', state(memory, UNPINNED_HOST), PROXY_KEPT)
+  calls.length = 0
+  await fetchImpl(UNPINNED)
+  check('the next request goes straight to the proxy', calls, ['proxy'])
+}
+
+// --- 3. Both silent: direct gets one unbounded fallback attempt -------------
+{
+  const { calls, memory, fetchImpl } = harness({ direct: (n) => (n === 0 ? silent() : ok()), proxy: () => silent() })
+  const response = await fetchImpl(UNPINNED)
+  check('both probes fail and direct gets the last attempt', calls, ['direct', 'proxy', 'direct'])
+  check('the fallback answers the caller', response.status, 200)
+  check('the fallback settles the host on direct', state(memory, UNPINNED_HOST), DIRECT_KEPT)
+}
+
+// --- 4. A settled channel that fails gets one probe of the other -----------
+{
+  let directMode = 'ok'
+  const { calls, memory, fetchImpl } = harness({
+    direct: () => {
+      if (directMode === 'fail') throw failure('ECONNREFUSED')
+      return ok()
+    },
+  })
+  await fetchImpl(UNPINNED)
+  directMode = 'fail'
+  calls.length = 0
+  const response = await fetchImpl(UNPINNED)
+  check('a failed settled channel probes the other one', calls, ['direct', 'proxy'])
+  check('the rescuing channel is answered', response.status, 200)
+  check('and it is kept', state(memory, UNPINNED_HOST), PROXY_KEPT)
+}
+
+// --- 5. Both channels failing ends the request and forgets the host --------
+{
+  const { calls, memory, attempts, fetchImpl } = harness({
+    direct: () => { throw failure('ECONNREFUSED') },
+    proxy: () => { throw failure('ECONNRESET') },
+  })
   let surfaced
   try {
     await fetchImpl(UNPINNED)
   } catch (error) {
     surfaced = error.cause?.code
   }
-  check('every attempt alternates', calls, ['direct', 'proxy', 'direct', 'proxy'])
-  check('the original error surfaces', surfaced, 'ECONNRESET')
-  check('every attempt was recorded', attempts.map((a) => a.channel), ['direct', 'proxy', 'direct', 'proxy'])
-  check('the failures carry their code', attempts.map((a) => a.code), ['ECONNREFUSED', 'ECONNRESET', 'ECONNREFUSED', 'ECONNRESET'])
-  check('three retries were reported', retries.length, 3)
-  check('the retry budget is what stops it', retries[2].maxRetries, 3)
-  check('the rotation ends on direct', rotation.stateOf(UNPINNED_HOST), 'direct')
+  check('the probe sequence is direct, proxy, direct fallback', calls, ['direct', 'proxy', 'direct'])
+  check('the last failure surfaces', surfaced, 'ECONNREFUSED')
+  check('every attempt was recorded', attempts.map((a) => a.channel), ['direct', 'proxy', 'direct'])
+  check('the failures carry their code', attempts.map((a) => a.code), ['ECONNREFUSED', 'ECONNRESET', 'ECONNREFUSED'])
+  check('a host nothing answered for is forgotten', state(memory, UNPINNED_HOST), '(none)')
 }
 
-// --- 3. One failure is enough to move the host -----------------------------
+// --- 6. A pinned host never probes and never falls back --------------------
 {
-  const { calls, rotation, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') } })
-  const response = await fetchImpl(UNPINNED)
-  check('the retry takes the proxy', calls, ['direct', 'proxy'])
-  check('the caller never sees the failure', response.status, 200)
-  // The answered retry moved the cursor on again, so the *next* request starts
-  // direct: both channels stay in use.
-  check('the answered retry moves the cursor back to direct', rotation.stateOf(UNPINNED_HOST), 'direct')
-}
-
-// --- 4. The rotation continues into the next request -----------------------
-// "One direct, one proxy" is the rule for a *host*, not for a single call: the
-// next request from DSH picks up where the last one stopped.
-{
-  const { calls, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') } })
-  await fetchImpl(UNPINNED)
-  await fetchImpl(UNPINNED)
-  // Request 1: direct fails, proxy answers (cursor -> direct). Request 2 starts
-  // where that left it, so the two requests read as one continuous rotation.
-  check('the rotation carries into the next request', calls, ['direct', 'proxy', 'direct', 'proxy'])
-}
-{
-  // And once the proxy fails too, the request after that starts direct again.
-  const { calls, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') }, proxy: () => { throw failure('ECONNREFUSED') } })
-  try { await fetchImpl(UNPINNED) } catch { /* exhausted */ }
-  try { await fetchImpl(UNPINNED) } catch { /* exhausted */ }
-  check('the sequence keeps alternating across requests',
-    calls,
-    ['direct', 'proxy', 'direct', 'proxy', 'direct', 'proxy', 'direct', 'proxy'])
-}
-
-// --- 5. A pinned host never alternates -------------------------------------
-{
-  const { calls, rotation, fetchImpl } = harness({
+  const { calls, memory, fetchImpl } = harness({
     forcedProxy: (hostname) => hostname === 'mirror.example',
+    proxy: (n) => (n === 0 ? ok() : ok()),
     direct: () => { throw failure('ECONNREFUSED') },
   })
   const response = await fetchImpl(PINNED)
   check('a pinned host is proxied on its first attempt', calls, ['proxy'])
   check('and answers from there', response.status, 200)
-  check('a pinned host records no rotation', rotation.stateOf('mirror.example'), undefined)
+  check('a pinned host records no memory', state(memory, 'mirror.example'), '(none)')
 }
 {
-  // Even when the proxy fails, a pinned host does not rotate: it is pinned.
   const { calls, fetchImpl } = harness({
     forcedProxy: (hostname) => hostname === 'mirror.example',
     proxy: () => { throw failure('ECONNREFUSED') },
@@ -145,13 +178,13 @@ function harness(options = {}) {
   } catch {
     surfaced = true
   }
-  check('a pinned host stays on the proxy', calls, ['proxy', 'proxy', 'proxy', 'proxy'])
+  check('a pinned host retries its own channel', calls, ['proxy', 'proxy', 'proxy', 'proxy'])
   check('its failure surfaces', surfaced, true)
 }
 
-// --- 6. Loopback and LAN never leave the machine ---------------------------
+// --- 7. Loopback and LAN never leave the machine ---------------------------
 {
-  const { calls, rotation, fetchImpl } = harness({
+  const { calls, memory, fetchImpl } = harness({
     forcedProxy: () => true,
     direct: () => { throw failure('ECONNREFUSED') },
   })
@@ -163,10 +196,10 @@ function harness(options = {}) {
   }
   check('a loopback host is always direct', calls, ['direct', 'direct', 'direct', 'direct'])
   check('its failure surfaces', surfaced, true)
-  check('loopback never enters the rotation', rotation.stateOf('127.0.0.1'), undefined)
+  check('loopback never enters the memory', state(memory, '127.0.0.1'), '(none)')
 }
 
-// --- 7. What may be retried is still the transport layer's decision --------
+// --- 8. What may be retried is still the transport layer's decision --------
 for (const code of ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'ETIMEDOUT']) {
   const { calls, fetchImpl } = harness({
     retryOnPossibleDelivery: false,
@@ -182,8 +215,8 @@ for (const code of ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'ETIMEDOUT']) {
   check(code + ' surfaces instead', surfaced, true)
 }
 {
-  // The shipped default retries it — on the other channel, because that is what
-  // the rotation does.
+  // The shipped default retries it — on the other channel, because that is the
+  // only channel the host has not just seen fail.
   const { calls, fetchImpl } = harness({ direct: () => { throw failure('ECONNRESET') } })
   const response = await fetchImpl(UNPINNED)
   check('a reset is retried on the proxy by default', calls, ['direct', 'proxy'])
@@ -202,10 +235,11 @@ for (const code of ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'ETIMEDOUT']) {
   check('it surfaces', surfaced, true)
 }
 
-// --- 8. The request's own limits are respected -----------------------------
+// --- 9. The request's own limits are respected -----------------------------
 {
-  // A streamed body cannot be replayed: sending it twice would truncate it.
-  const { calls, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') } })
+  // A streamed body cannot be replayed: sending it twice would truncate it, and
+  // aborting it to probe another channel would kill the only copy.
+  const { calls, memory, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') } })
   const body = new ReadableStream({ start(controller) { controller.close() } })
   let surfaced = false
   try {
@@ -215,10 +249,11 @@ for (const code of ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'ETIMEDOUT']) {
   }
   check('a non-replayable body is sent once', calls, ['direct'])
   check('its failure surfaces', surfaced, true)
+  check('it never moves the memory', state(memory, UNPINNED_HOST), '(none)')
 }
 {
   // A caller that gave up must not have a retry run behind its back.
-  const { calls, rotation, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') } })
+  const { calls, memory, fetchImpl } = harness({ direct: () => { throw failure('ECONNREFUSED') } })
   const controller = new AbortController()
   controller.abort()
   let surfaced = false
@@ -229,53 +264,125 @@ for (const code of ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'ETIMEDOUT']) {
   }
   check('an aborted call is not retried', calls, ['direct'])
   check('the abort surfaces', surfaced, true)
-  // The attempt still happened, so it still hands the next one to the other
-  // channel — the rotation is a round-robin, not a verdict on the outcome.
-  check('an aborted attempt still moves the cursor', rotation.stateOf(UNPINNED_HOST), 'proxy')
+  check('an aborted attempt does not move the memory', state(memory, UNPINNED_HOST), '(none)')
 }
 
-// --- 9. An HTTP status is a response, not a failure ------------------------
-// It ends the attempt like any other outcome, so it moves the cursor — but it is
-// never retried: a status is the server's answer, not a transport failure.
+// --- 10. An HTTP status is a response, not a failure -----------------------
+// It answers the request, so it settles the host like any other answer.
 {
-  const { calls, rotation, fetchImpl } = harness({ direct: () => new Response('nope', { status: 503 }) })
+  const { calls, memory, fetchImpl } = harness({ direct: () => ok(503) })
   const response = await fetchImpl(UNPINNED)
   check('an HTTP status is not retried', calls, ['direct'])
   check('the status reaches the caller', response.status, 503)
-  check('but it still moves the cursor', rotation.stateOf(UNPINNED_HOST), 'proxy')
+  check('but it still settles the host', state(memory, UNPINNED_HOST), DIRECT_KEPT)
 }
 
-// --- 10. The retry budget is configurable ----------------------------------
+// --- 11. The probe sequence is not a retry ---------------------------------
+// retryCount 0 means "do not re-dial a channel that answered"; choosing the
+// channel in the first place still takes the direct probe and the proxy probe.
 {
-  const { calls, fetchImpl } = harness({ retryCount: 0, direct: () => { throw failure('ECONNREFUSED') } })
+  const { calls, retries, fetchImpl } = harness({ retryCount: 0, direct: () => silent() })
+  const response = await fetchImpl(UNPINNED)
+  check('retryCount 0 still probes the other channel once', calls, ['direct', 'proxy'])
+  check('the probe is not reported as a retry', retries.length, 0)
+  check('and the caller is answered', response.status, 200)
+}
+
+// --- 12. An unparseable URL still reaches a channel ------------------------
+// The router must never be the reason a request that used to work stopped
+// working: a URL with no readable hostname goes direct and is not remembered.
+{
+  const { calls, memory, attempts, fetchImpl } = harness()
+  await fetchImpl('not a url', {})
+  check('a malformed URL takes the direct channel', calls, ['direct'])
+  check('its record names no host', attempts[0].hostname, '')
+  check('nothing was remembered', state(memory, ''), '(none)')
+}
+
+// --- 13. A failure with no transport code still moves the host -------------
+// The log that prompted this test: direct probe timed out, the proxy attempt
+// then failed in 0 ms with no code, and the host stayed on the doomed channel
+// for every later request. An unrecognised error must never freeze the choice.
+{
+  const { calls, memory, fetchImpl } = harness({
+    direct: () => { throw new TypeError('fetch failed') },
+  })
+  const response = await fetchImpl(UNPINNED)
+  check('a code-less probe failure moves to the proxy', calls, ['direct', 'proxy'])
+  check('the caller is answered', response.status, 200)
+  check('and the proxy answer is kept', state(memory, UNPINNED_HOST), PROXY_KEPT)
+}
+{
+  // Both channels fail without a code: the direct fallback still gets its one
+  // unbounded attempt instead of the request dying on the second attempt.
+  const { calls, memory, fetchImpl } = harness({
+    direct: (n) => {
+      if (n === 0) throw new TypeError('fetch failed')
+      return ok()
+    },
+    proxy: () => { throw new TypeError('Proxy response !== 200 when HTTP Tunneling') },
+  })
+  const response = await fetchImpl(UNPINNED)
+  check('two code-less failures end in the direct fallback', calls, ['direct', 'proxy', 'direct'])
+  check('the fallback answers the caller', response.status, 200)
+  check('and settles the host on direct', state(memory, UNPINNED_HOST), DIRECT_KEPT)
+}
+{
+  // A code-less failure on a channel that had answered is the same verdict:
+  // probe the other channel once.
+  let directMode = 'ok'
+  const { calls, memory, fetchImpl } = harness({
+    direct: () => {
+      if (directMode === 'fail') throw new TypeError('fetch failed')
+      return ok()
+    },
+  })
+  await fetchImpl(UNPINNED)
+  directMode = 'fail'
+  calls.length = 0
+  const response = await fetchImpl(UNPINNED)
+  check('a code-less failure on a settled channel probes the other', calls, ['direct', 'proxy'])
+  check('the rescuing channel answers', response.status, 200)
+  check('and is kept', state(memory, UNPINNED_HOST), PROXY_KEPT)
+}
+
+// --- 14. The switch still governs resending, not the recorded decision -----
+// With "retry possible delivery" off a code-less failure is not resent, but the
+// host must still move on — otherwise the next request repeats it forever.
+{
+  const { calls, memory, fetchImpl } = harness({
+    retryOnPossibleDelivery: false,
+    direct: () => { throw new TypeError('fetch failed') },
+  })
   let surfaced = false
   try {
     await fetchImpl(UNPINNED)
   } catch {
     surfaced = true
   }
-  check('retryCount 0 sends the request once', calls, ['direct'])
-  check('its failure surfaces', surfaced, true)
-}
-{
-  const { calls, fetchImpl } = harness({ retryCount: 1, direct: () => { throw failure('ECONNREFUSED') }, proxy: () => { throw failure('ECONNREFUSED') } })
-  try {
-    await fetchImpl(UNPINNED)
-  } catch {
-    // exhausted
-  }
-  check('retryCount 1 means two attempts', calls, ['direct', 'proxy'])
+  check('a code-less failure is not resent when the switch is off', calls, ['direct'])
+  check('it surfaces', surfaced, true)
+  check('but the host moves on to the other channel', state(memory, UNPINNED_HOST), PROBE_PROXY)
+  const response = await fetchImpl(UNPINNED)
+  check('the next request starts on that channel', calls, ['direct', 'proxy'])
+  check('and is answered there', response.status, 200)
 }
 
-// --- 11. An unparseable URL still reaches a channel ------------------------
-// The router must never be the reason a request that used to work stopped
-// working: a URL with no readable hostname goes direct and is not rotated.
+// --- 15. A caller-supplied Request keeps its body across the retry ---------
+// The body is consumed when it is read, so a per-attempt normalisation made the
+// second attempt fail instantly with "Body is unusable" — a code-less failure
+// that looked exactly like the one above.
 {
-  const { calls, rotation, attempts, fetchImpl } = harness()
-  await fetchImpl('not a url', {})
-  check('a malformed URL takes the direct channel', calls, ['direct'])
-  check('its record names no host', attempts[0].hostname, '')
-  check('nothing was rotated', rotation.stateOf(''), undefined)
+  const { calls, bodies, fetchImpl } = harness({ direct: () => silent() })
+  const request = new Request(UNPINNED, {
+    method: 'POST',
+    body: '{"model":"x"}',
+    headers: { 'content-type': 'application/json' },
+  })
+  const response = await fetchImpl(request)
+  check('a Request body is re-sent on the retry', bodies.proxy.map((body) => new TextDecoder().decode(body)), ['{"model":"x"}'])
+  check('the retry actually happened', calls, ['direct', 'proxy'])
+  check('and the caller is answered', response.status, 200)
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)

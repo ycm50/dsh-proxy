@@ -1,0 +1,164 @@
+/**
+ * The dsh-proxy settings page's staged form over the `dsh-proxy` settings
+ * namespace, plus the read-only `llm-pi-ai` view that supplies the known-host
+ * pick list for the two host fields.
+ *
+ * DSH 0.1.7 owns the staging contract: `SettingsFormModel` (the same model the
+ * bundled settings pages use) holds the drafts, derives each control's
+ * effective value and overridden badge from the shared config form, and writes
+ * every edit in one revision-fenced `mutate` on save. This module only says how
+ * this plugin's four fields convert between stored values and draft text,
+ * where the pick list comes from, and how the page reaches the Host half to ask
+ * what proxy this machine is configured with.
+ * @module dsh-proxy/client/form-controller
+ */
+import type { Context as ClientContext } from '@deepseek-ai/cordis';
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store';
+import type { SettingsFieldState, SettingsFormActions, SettingsFormShell } from '@deepseek-ai/dsh-client-ui-primitives';
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client';
+import type { SystemProxyReading } from '../rpc-contract.js';
+/** The `dsh-proxy` section fields this page edits (the wire shape). */
+export interface HttpProxySettings {
+    /** Proxy URL (http/https/socks4/socks4a/socks5/socks5h); empty = inactive. */
+    proxy?: string;
+    /** Hostnames pinned to the proxy: always proxied, never alternated. */
+    forceHosts?: string[];
+    /** Whether the machine's own proxy configuration supplies the address. */
+    useSystemProxy?: boolean;
+    /** Whether child processes (plugin install/update) inherit the proxy. */
+    proxySubprocesses?: boolean;
+    /** Whether the attempt record is appended to a file. */
+    debugLog?: boolean;
+    /** Ceiling for a TCP connect and for a proxy CONNECT tunnel, in milliseconds. */
+    connectTimeoutMs?: number;
+    /** Ceiling for waiting on response headers; 0 disables the watchdog. */
+    responseTimeoutMs?: number;
+    /** Ceiling for the gap between streaming body chunks; 0 disables it. */
+    streamIdleTimeoutMs?: number;
+    /** How long an unproven direct channel gets to answer, in milliseconds. */
+    probeTimeoutMs?: number;
+    /** How long an unproven proxy tunnel gets to answer, in milliseconds. */
+    proxyProbeTimeoutMs?: number;
+    /** Transport-level retries for connection failures (0 turns them off). */
+    retryCount?: number;
+    /** First backoff delay for a transport retry. */
+    retryDelayMs?: number;
+    /** Whether a reset that may have arrived after delivery is retried too. */
+    retryOnPossibleDelivery?: boolean;
+}
+/** The `llm-pi-ai` section subset this page reads for known model gateways. */
+export interface PiAiSettings {
+    providers?: Record<string, {
+        baseURL?: string;
+    }>;
+}
+/** The host-list field, which has the one control shape. */
+export type HostFieldName = 'forceHosts';
+/** The staged on/off switches: the subprocess one and the retry-safety one. */
+export type BooleanFieldName = 'useSystemProxy' | 'proxySubprocesses' | 'debugLog' | 'retryOnPossibleDelivery';
+/**
+ * The numeric fields of the stability group.
+ *
+ * They are staged as text like every other field, so the draft is what the user
+ * typed and the Host schema stays the only judge of what is acceptable; the
+ * page shows its verdict as the field's invalid state.
+ */
+export type NumberFieldName = 'connectTimeoutMs' | 'responseTimeoutMs' | 'streamIdleTimeoutMs' | 'probeTimeoutMs' | 'proxyProbeTimeoutMs' | 'retryCount' | 'retryDelayMs';
+/** One editable field of the page. */
+export type FieldName = 'proxy' | HostFieldName | BooleanFieldName | NumberFieldName;
+/** What the dsh-proxy settings page renders. */
+export interface HttpProxyFormState extends SettingsFormShell {
+    /** Staged proxy URL. */
+    proxy: SettingsFieldState;
+    /** Staged always-proxied hosts, comma/whitespace separated. */
+    forceHosts: SettingsFieldState;
+    /** Staged "use the system proxy" switch. */
+    useSystemProxy: SettingsFieldState;
+    /** Staged "child processes inherit the proxy" switch. */
+    proxySubprocesses: SettingsFieldState;
+    /** Staged "append the attempt record to a file" switch. */
+    debugLog: SettingsFieldState;
+    /** Staged connect ceiling, in milliseconds. */
+    connectTimeoutMs: SettingsFieldState;
+    /** Staged response-header ceiling, in milliseconds. */
+    responseTimeoutMs: SettingsFieldState;
+    /** Staged streaming idle ceiling, in milliseconds. */
+    streamIdleTimeoutMs: SettingsFieldState;
+    /** Staged direct probe budget, in milliseconds. */
+    probeTimeoutMs: SettingsFieldState;
+    /** Staged proxy probe budget, in milliseconds. */
+    proxyProbeTimeoutMs: SettingsFieldState;
+    /** Staged connection retry budget (attempts after the first). */
+    retryCount: SettingsFieldState;
+    /** Staged first backoff delay, in milliseconds. */
+    retryDelayMs: SettingsFieldState;
+    /** Staged "retry a possibly-delivered failure too" switch. */
+    retryOnPossibleDelivery: SettingsFieldState;
+    /** Known model hostnames offered beside the host field (free text still allowed). */
+    suggestions: string[];
+}
+/** One answer to the page's "read the system proxy" request. */
+export type SystemProxyRead = {
+    status: 'ok';
+    reading: SystemProxyReading;
+} | {
+    status: 'unavailable';
+} | {
+    status: 'failed';
+    message: string;
+};
+/** The registration-side face the settings section injects. */
+export interface HttpProxyFormFace extends SettingsFormActions {
+    /** Form snapshot bound by the renderer as useHttpProxyForm. */
+    hooks: {
+        httpProxyForm: SnapshotStore<HttpProxyFormState>;
+    };
+    /**
+     * Ask the Host half for this machine's proxy configuration. Never rejects:
+     * a deployment without a Connection channel answers `unavailable`.
+     */
+    readSystemProxy(): Promise<SystemProxyRead>;
+}
+/** Bridges the `dsh-proxy` config form onto the settings page. */
+export declare class HttpProxyFormController {
+    private readonly ctx;
+    private readonly scope;
+    private readonly knownNs;
+    private readonly form;
+    private readonly mirror;
+    private readonly store;
+    private readonly disposers;
+    /**
+     * @param ctx - the browser plugin context, for the shared settings mirror.
+     * @param scope - the shared config form of the `dsh-proxy` Host entry.
+     * @param knownNs - namespace whose configured gateways feed the pick list.
+     */
+    constructor(ctx: ClientContext, scope: ConfigForm<HttpProxySettings>, knownNs: string);
+    /** Stop observing the mirror and the form. Idempotent. */
+    dispose(): void;
+    /**
+     * Build the face the section's slot registration injects.
+     * @returns the page's snapshot and its form actions.
+     */
+    inject(): HttpProxyFormFace;
+    /**
+     * Ask the Host half what proxy this machine is configured with.
+     *
+     * The browser cannot read a registry, so the checkbox is a round trip: the
+     * answer either carries a reading the page fills its field from, or says why
+     * there is none. Nothing here throws — the page shows the failure and leaves
+     * the form alone.
+     * @returns the reading, or why there is none.
+     */
+    private readSystemProxy;
+    private publish;
+    private projection;
+    /**
+     * Hostnames offered by the host field as a convenience: the default
+     * DeepSeek host, the built-in pi-ai catalog endpoints, every configured
+     * gateway, and what is already saved. The list is a pick list only — it does
+     * not decide what is routed.
+     */
+    private suggestions;
+}
+//# sourceMappingURL=form-controller.d.ts.map

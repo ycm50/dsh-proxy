@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.pnpm-store/
+
+# Build output — lib/ (including lib/profile-patch.js and lib/types) is committed
+# ON PURPOSE, so a GitHub or tarball install needs no build step
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+
+# Packed artifacts
+*.tgz
+
+# Self-cleanup staging (profile-patch writes beside the patch, then renames)
+*.prune.tmp
+
+# Logs and diagnostics
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*-sample.txt
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo

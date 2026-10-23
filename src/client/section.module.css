@@ -1,0 +1,57 @@
+/**
+ * Chrome for the dsh-proxy settings page.
+ *
+ * A settings section owns its own column contents — the shell contributes the
+ * navigation row only — so this mirrors the wrapper the bundled settings pages
+ * use (same max width, same heading scale, same tertiary intro), which is what
+ * keeps a plugin-authored page looking like it shipped with DSH. Colors come
+ * from the host's `--dsw-*` tokens, never from literals.
+ */
+
+.section {
+  max-width: 720px;
+  color: var(--dsw-alias-label-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.heading {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.intro {
+  color: var(--dsw-alias-label-tertiary);
+  margin: 0;
+  font-size: 13px;
+}
+
+/* The system-proxy switch reads as a boxed aside beside the address field it
+   fills: the switch itself is the host's own checkbox, the copy underneath
+   explains the round trip, and the status line reports the last attempt. */
+.systemProxy,
+.boolean {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.hint {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.status {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}

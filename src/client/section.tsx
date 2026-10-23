@@ -1,0 +1,369 @@
+/**
+ * The dsh-proxy settings page: the page the Settings panel's own left-hand
+ * navigation opens, rendered in the content column beside the bundled ones.
+ *
+ * A plugin that owns a settings page draws the column contents — the shell
+ * contributes the nav row — so this file owns the heading, the one-line intro,
+ * and the three controls. The controls are the host's own `SettingsForm` +
+ * `SettingsValueField`, which is what gives the page the overridden badge, the
+ * reset-to-default control, the staged-draft save, and the read-only and
+ * unavailable notices without this plugin restating any of them.
+ * @module dsh-proxy/client/section
+ */
+
+import { useState } from 'react'
+import type { ReactElement, ReactNode } from 'react'
+import { Button, Checkbox, SettingsForm, SettingsValueField } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { SettingsFieldState, SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { SystemProxySource } from '../rpc-contract.js'
+import type { HttpProxySectionProps, HttpProxyTranslate } from './contract.js'
+import type { BooleanFieldName, HostFieldName, NumberFieldName } from './form-controller.js'
+import { matchesHostEntry, normalizeHostEntry, splitHostEntries } from '../hosts.js'
+import css from './section.module.css'
+
+/** The form frame's copy, read from this page's dictionary. */
+function formLabels(t: HttpProxyTranslate): SettingsFormLabels {
+  return {
+    unavailable: t('unavailable'),
+    readOnly: t('readOnly'),
+    saveFailed: t('saveFailed'),
+    save: t('save'),
+    saving: t('saving'),
+  }
+}
+
+/**
+ * Append one host to a control's text, skipping one an entry already covers.
+ *
+ * Entries are umbrellas, so listing `commandcode.ai` already reaches
+ * `api.commandcode.ai` — offering to add the child would only add a redundant
+ * line the Host half would treat identically.
+ */
+function appendHost(current: string, host: string): string {
+  const parts = splitHostEntries(current)
+  const covered = parts.some((part) => {
+    const entry = normalizeHostEntry(part)
+    return entry !== undefined && matchesHostEntry(host, entry)
+  })
+  if (!covered) parts.push(host)
+  return parts.join(', ')
+}
+
+/**
+ * The known-host pick list, disclosed by the information button beside a host
+ * field's label.
+ *
+ * It is a convenience, not the field's vocabulary: the control stays free
+ * text, so a private gateway nothing here knows about is typed as usual. A
+ * host the field already covers is left out rather than offered and then
+ * deduplicated on the way in.
+ */
+function KnownHosts(props: {
+  t: HttpProxyTranslate
+  hosts: string[]
+  current: string
+  disabled: boolean
+  onPick: (host: string) => void
+}): ReactElement {
+  const entries = splitHostEntries(props.current)
+    .map(entry => normalizeHostEntry(entry))
+    .filter((entry): entry is string => entry !== undefined)
+  const options = props.hosts.filter(host => !entries.some(entry => matchesHostEntry(host, entry)))
+  return (
+    <div>
+      <p>{options.length > 0 ? props.t('suggestionsHint') : props.t('suggestionsEmpty')}</p>
+      {options.map(host => (
+        <Button
+          key={host}
+          variant="ghost"
+          size="sm"
+          disabled={props.disabled}
+          onClick={() => { props.onPick(host) }}
+        >
+          {host}
+        </Button>
+      ))}
+    </div>
+  )
+}
+
+/** One host field: the shared value field plus its pick list. */
+function HostField(props: {
+  t: HttpProxyTranslate
+  id: string
+  label: string
+  hint: string
+  state: SettingsFieldState
+  suggestions: string[]
+  disabled: boolean
+  onEdit: (text: string) => void
+  onReset: () => void
+  onPick: (host: string) => void
+}): ReactElement {
+  const { t } = props
+  const help: { label: string; content: ReactNode } = {
+    label: t('suggestions'),
+    content: (
+      <KnownHosts
+        t={t}
+        hosts={props.suggestions}
+        current={props.state.text}
+        disabled={props.disabled}
+        onPick={props.onPick}
+      />
+    ),
+  }
+  return (
+    <SettingsValueField
+      id={props.id}
+      label={props.label}
+      hint={props.hint}
+      overriddenLabel={t('overridden')}
+      resetLabel={t('reset')}
+      invalidLabel={t('invalid')}
+      help={help}
+      disabled={props.disabled}
+      {...props.state}
+      onEdit={props.onEdit}
+      onReset={props.onReset}
+    />
+  )
+}
+
+/**
+ * Name the mechanism a reading came from, in the active locale.
+ * @param t - this page's translate function.
+ * @param source - the reading's source.
+ * @returns one short phrase to append to the status line.
+ */
+function sourceLabel(t: HttpProxyTranslate, source: SystemProxySource): string {
+  switch (source) {
+    case 'windows-registry': return t('systemProxyFromWindows')
+    case 'env': return t('systemProxyFromEnv')
+    case 'macos-scutil': return t('systemProxyFromMacos')
+    case 'linux-gsettings': return t('systemProxyFromLinux')
+    default: return t('systemProxyFromNone')
+  }
+}
+
+/**
+ * One staged on/off control: the host's own checkbox plus the copy that
+ * explains it.
+ *
+ * A checkbox has no third state, so ticking it stages an explicit `"true"` or
+ * `"false"` text, which the form model's boolean spec writes as the boolean the
+ * Host schema declares — the same gesture as every other control on the page,
+ * saved only when the user saves.
+ */
+function BooleanControl(props: {
+  t: HttpProxyTranslate
+  id: string
+  label: string
+  hint: string
+  state: SettingsFieldState
+  disabled: boolean
+  onToggle: (checked: boolean) => void
+  status: string | undefined
+}): ReactElement {
+  return (
+    <div className={css.boolean} data-field={props.id}>
+      <Checkbox
+        checked={props.state.text === 'true'}
+        disabled={props.disabled}
+        label={props.label}
+        onChange={props.onToggle}
+      />
+      <p className={css.hint}>{props.hint}</p>
+      {props.status !== undefined ? <p className={css.status} role="status">{props.status}</p> : null}
+    </div>
+  )
+}
+
+/**
+ * The "use the system proxy" switch and the line reporting what reading it
+ * produced.
+ *
+ * The switch is a staged field like every other control on the page, but the
+ * reading it triggers is immediate: the Host is asked as soon as the box is
+ * ticked, and the answer drafts the address field above it, ready for the same
+ * save. The status line is page-local state — it describes one attempt, not a
+ * setting.
+ */
+function SystemProxyControl(props: {
+  t: HttpProxyTranslate
+  state: SettingsFieldState
+  disabled: boolean
+  status: string | undefined
+  onToggle: (checked: boolean) => void
+}): ReactElement {
+  return (
+    <BooleanControl
+      t={props.t}
+      id="useSystemProxy"
+      label={props.t('useSystemProxy')}
+      hint={props.t('useSystemProxyHint')}
+      state={props.state}
+      disabled={props.disabled}
+      status={props.status}
+      onToggle={props.onToggle}
+    />
+  )
+}
+
+/**
+ * Render the dsh-proxy settings page.
+ * @param props - locale copy, the page snapshot, and its form actions.
+ * @returns the page column.
+ */
+export function HttpProxySection(props: HttpProxySectionProps): ReactElement {
+  const { t } = props
+  const state = props.useHttpProxyForm(snapshot => snapshot)
+  const disabled = !state.writable
+  /** What the last attempt to read the system proxy reported. */
+  const [status, setStatus] = useState<string | undefined>(undefined)
+
+  /**
+   * Stage the switch, and — when it is being turned on — read the machine's
+   * proxy and draft the address field with it.
+   *
+   * Unticking only stages the switch: an address already on screen is the
+   * user's to keep or clear, never something this control deletes.
+   * @param checked - the box's requested state.
+   */
+  const toggleSystemProxy = async (checked: boolean): Promise<void> => {
+    props.edit('useSystemProxy', checked ? 'true' : 'false')
+    if (!checked) {
+      setStatus(undefined)
+      return
+    }
+    setStatus(t('systemProxyReading'))
+    const outcome = await props.readSystemProxy()
+    if (outcome.status === 'unavailable') {
+      setStatus(t('systemProxyUnavailable'))
+      return
+    }
+    if (outcome.status === 'failed') {
+      setStatus(`${t('systemProxyFailed')}: ${outcome.message}`)
+      return
+    }
+    const { reading } = outcome
+    if (reading.proxy.length === 0) {
+      setStatus(reading.pacUrl === undefined
+        ? t('systemProxyNone')
+        : `${t('systemProxyPac')}: ${reading.pacUrl}`)
+      return
+    }
+    props.edit('proxy', reading.proxy)
+    setStatus(`${t('systemProxyDetected')}: ${reading.proxy} · ${sourceLabel(t, reading.source)}`)
+  }
+  /**
+   * One staged on/off switch of this page.
+   *
+   * The label and the hint share the field's name, so the two dictionary keys
+   * a switch needs are its name and its name with `Hint` — the same pairing
+   * every other control on the page uses.
+   * @param field - the field's name for its staged edit.
+   * @param id - the wrapper's `data-field` and the control's identity.
+   * @returns the switch.
+   */
+  const booleanControl = (
+    field: BooleanFieldName,
+    id: string,
+  ): ReactElement => (
+    <BooleanControl
+      t={t}
+      id={id}
+      label={t(field)}
+      hint={t(`${field}Hint`)}
+      state={state[field]}
+      disabled={disabled}
+      status={undefined}
+      onToggle={checked => { props.edit(field, checked ? 'true' : 'false') }}
+    />
+  )
+  /**
+   * One staged numeric field of the stability group.
+   *
+   * `numeric` only hints a numeric keypad; what a value may be stays the Host
+   * schema's business, and its verdict appears as the field's invalid state.
+   */
+  const numberControl = (field: NumberFieldName, id: string): ReactElement => (
+    <SettingsValueField
+      id={id}
+      label={t(field)}
+      hint={t(`${field}Hint`)}
+      numeric
+      overriddenLabel={t('overridden')}
+      resetLabel={t('reset')}
+      invalidLabel={t('invalid')}
+      disabled={disabled}
+      {...state[field]}
+      onEdit={text => { props.edit(field, text) }}
+      onReset={() => { props.resetField(field) }}
+    />
+  )
+  const hostField = (field: HostFieldName, id: string, label: string, hint: string): ReactElement => (
+    <HostField
+      t={t}
+      id={id}
+      label={label}
+      hint={hint}
+      state={state[field]}
+      suggestions={state.suggestions}
+      disabled={disabled}
+      onEdit={text => { props.edit(field, text) }}
+      onReset={() => { props.resetField(field) }}
+      onPick={host => { props.edit(field, appendHost(state[field].text, host)) }}
+    />
+  )
+  return (
+    <section className={css.section} aria-labelledby="dsh-proxy-heading">
+      <h2 className={css.heading} id="dsh-proxy-heading">{t('title')}</h2>
+      <p className={css.intro}>{t('description')}</p>
+      <SettingsForm
+        labels={formLabels(t)}
+        state={state}
+        onSave={props.save}
+        onDiscard={props.discard}
+      >
+        <h3 className={css.heading} id="dsh-proxy-connection-heading">{t('connection')}</h3>
+        <p className={css.intro}>{t('connectionHint')}</p>
+        <SettingsValueField
+          id="dsh-proxy-url"
+          label={t('proxy')}
+          hint={t('proxyHint')}
+          placeholder="socks5://127.0.0.1:7890"
+          overriddenLabel={t('overridden')}
+          resetLabel={t('reset')}
+          invalidLabel={t('invalid')}
+          disabled={disabled}
+          {...state.proxy}
+          onEdit={text => { props.edit('proxy', text) }}
+          onReset={() => { props.resetField('proxy') }}
+        />
+        <SystemProxyControl
+          t={t}
+          state={state.useSystemProxy}
+          disabled={disabled}
+          status={status}
+          onToggle={checked => { void toggleSystemProxy(checked) }}
+        />
+        {booleanControl('proxySubprocesses', 'dsh-proxy-subprocesses')}
+        {booleanControl('debugLog', 'dsh-proxy-debug-log')}
+        <h3 className={css.heading} id="dsh-proxy-domains-heading">{t('domains')}</h3>
+        <p className={css.intro}>{t('domainsHint')}</p>
+        {hostField('forceHosts', 'dsh-proxy-force', t('force'), t('forceHint'))}
+        <h3 className={css.heading} id="dsh-proxy-stability-heading">{t('stability')}</h3>
+        <p className={css.intro}>{t('stabilityHint')}</p>
+        {numberControl('connectTimeoutMs', 'dsh-proxy-connect-timeout')}
+        {numberControl('responseTimeoutMs', 'dsh-proxy-response-timeout')}
+        {numberControl('streamIdleTimeoutMs', 'dsh-proxy-stream-idle')}
+        {numberControl('probeTimeoutMs', 'dsh-proxy-probe-timeout')}
+        {numberControl('proxyProbeTimeoutMs', 'dsh-proxy-proxy-probe-timeout')}
+        {numberControl('retryCount', 'dsh-proxy-retry-count')}
+        {numberControl('retryDelayMs', 'dsh-proxy-retry-delay')}
+        {booleanControl('retryOnPossibleDelivery', 'dsh-proxy-retry-possible')}
+      </SettingsForm>
+    </section>
+  )
+}
